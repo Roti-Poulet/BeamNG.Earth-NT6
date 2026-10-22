@@ -31,10 +31,17 @@ MOD_NAME = "beamng_earth"
 VENV = os.path.join(ROOT, ".venv")
 REQUIREMENTS = os.path.join(ROOT, "server", "requirements.txt")
 CONFIG = os.path.join(ROOT, ".beamng_earth.json")
-REQ_STAMP = os.path.join(VENV, ".requirements.sha256")
+REQ_STAMP = os.path.join(ROOT, ".requirements.sha256")      # no venv any more: the packages go into PYTHON_EXE
 STEAM_APP_ID = "284160"
 MIN_PY = (3, 10)
 IS_WIN = os.name == "nt"
+
+# --- Windows 7 standalone build: the embedded Python lives in the "python" folder next to this file ---
+# (override with the BNGE_PYTHON_DIR environment variable). pip is run as "python.exe -m pip": the
+# Scripts\\pip.exe launcher has the original install path written into it, so it is not relocatable.
+PY_DIR = os.environ.get("BNGE_PYTHON_DIR") or os.path.join(ROOT, "python")
+PYTHON_EXE = os.path.join(PY_DIR, "python.exe")
+PYTHONW_EXE = os.path.join(PY_DIR, "pythonw.exe")
 
 
 def say(msg=""):
@@ -218,7 +225,6 @@ def install_mod(user_dir, assume_yes, dry_run, quiet=False):
         if dry_run:
             say(f"(dry run) would replace {dest}")
             return None
-        old_times = _unchanged_times(dest, MOD_SRC)
         shutil.rmtree(dest)
         status = "updated"
     elif dry_run:
@@ -228,60 +234,43 @@ def install_mod(user_dir, assume_yes, dry_run, quiet=False):
         status = "installed"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copytree(MOD_SRC, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
-    if status == "updated":
-        _stamp_times(dest, old_times)
     note(f"Mod: installed to {dest}")
     return status
 
 
-# The game packs a terrain material's textures into its own cache (temp/art/terrainMaterialCache) and packs them again,
-# 1.5-3 s each on its main thread, whenever a source file is newer than its cache entry ("cache outdated" in its log).
-# An update copied every file with the build's times (a fresh checkout's: new), so the first session after each one
-# repacked every ground material as it first appeared: freezes of ~2.7 s driving into new ground (the user,
-# 2026-10-21: "freezes" in Pécs and Brisbane on 1.5.4, 13 repacks in the game's log). An unchanged file keeps the
-# time of the copy it replaces; a changed one gets now, newer than any cache entry made from its old content.
-def _unchanged_times(dest, src):
-    """{relative path: (atime, mtime)} of the files in dest whose content is the same in src."""
-    import filecmp
-    out = {}
-    for dirpath, _, filenames in os.walk(dest):
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            rel = os.path.relpath(full, dest)
-            other = os.path.join(src, rel)
-            try:
-                if os.path.isfile(other) and filecmp.cmp(full, other, shallow=False):
-                    st = os.stat(full)
-                    out[rel] = (st.st_atime, st.st_mtime)
-            except OSError:
-                pass
-    return out
-
-
-def _stamp_times(dest, old_times):
-    """The installed files' times: an unchanged file's (old_times) as before, the others now."""
-    for dirpath, _, filenames in os.walk(dest):
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            try:
-                os.utime(full, old_times.get(os.path.relpath(full, dest)))
-            except OSError:
-                pass
-
-
 # --- the server's Python environment ------------------------------------------------------------
 
+def check_python():
+    """The embedded Python (python.exe, pythonw.exe) must exist; says which one is missing."""
+    if not IS_WIN:
+        return
+    missing = [p for p in (PYTHON_EXE, PYTHONW_EXE) if not os.path.isfile(p)]
+    if missing:
+        fail("Python not found where expected:\n  " + "\n  ".join(missing) +
+             "\n  Edit PY_DIR in install.py, or set the BNGE_PYTHON_DIR environment variable.")
+
+
 def venv_python():
-    return os.path.join(VENV, "Scripts", "python.exe") if IS_WIN else os.path.join(VENV, "bin", "python")
+    """The interpreter the server runs with: the fixed Python on Windows (no virtual environment)."""
+    return PYTHON_EXE if IS_WIN else os.path.join(VENV, "bin", "python")
+
+
+def venv_pythonw():
+    """Same, without a console window (pythonw.exe); python.exe elsewhere."""
+    return PYTHONW_EXE if IS_WIN else venv_python()
+
+
+def pip_cmd():
+    return [venv_python(), "-m", "pip"]
 
 
 def setup_venv(dry_run):
     py = venv_python()
     if dry_run:
-        say(f"(dry run) would {'reuse' if os.path.isfile(py) else 'create'} the virtual environment {VENV} "
-            f"and pip-install {os.path.relpath(REQUIREMENTS, ROOT)}")
+        say(f"(dry run) would pip-install {os.path.relpath(REQUIREMENTS, ROOT)} with {py} -m pip")
         return
-    if not os.path.isfile(py):
+    check_python()
+    if not IS_WIN and not os.path.isfile(py):
         say(f"Python packages: creating a virtual environment in {VENV} ...")
         r = subprocess.run([sys.executable, "-m", "venv", VENV])
         if r.returncode != 0 or not os.path.isfile(py):
@@ -289,7 +278,7 @@ def setup_venv(dry_run):
                     "Reinstall Python from python.org (keep the default options, tick 'Add python.exe to PATH').")
             fail("could not create the virtual environment. " + hint)
     say("Python packages: installing the server's requirements (numpy, Pillow, duckdb, fsspec) ...")
-    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+    cmd = pip_cmd() + ["install", "--disable-pip-version-check"]
     if IS_WIN:
         # Without a matching wheel (e.g. a newer Python), pip tries to compile DuckDB and fails without MSVC.
         cmd.append("--only-binary=duckdb")
@@ -351,6 +340,7 @@ def main():
     if sys.version_info < MIN_PY:
         fail(f"Python {MIN_PY[0]}.{MIN_PY[1]} or newer is needed (this is {sys.version.split()[0]}). "
              "Get it from https://www.python.org/downloads/")
+    check_python()
     say(f"BeamNG.Earth {version()} installer")
     say("")
     user_dir = choose_user_dir(args)
