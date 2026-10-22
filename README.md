@@ -2,10 +2,10 @@
 
 A port of BeamNG.Earth for the NT 6 kernel (Windows Vista/Server 2008/7/8.x), using a custom python version (which is included) patched by adang1345 [https://github.com/adang1345/PythonVista].
 
-## How to use?
+## How to use on an NT6-based OS?
 1. Clone the repo using:
 ```
-git clone
+git clone https://github.com/Roti-Poulet/BeamNG.Earth-NT6
 ```
 2. Run install.bat
 3. Run launcher.bat
