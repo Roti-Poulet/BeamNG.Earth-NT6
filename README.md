@@ -1,4 +1,19 @@
-# BeamNG.Earth
+# BeamNG.Earth-NT6
+
+A port of BeamNG.Earth for the NT 6 kernel (Windows Vista/Server 2008/7/8.x), using a custom python version (which is included) patched by adang1345 [https://github.com/adang1345/PythonVista].
+
+## How to use on an NT6-based OS?
+1. Clone the repo using:
+```
+git clone https://github.com/Roti-Poulet/BeamNG.Earth-NT6
+```
+2. Run install.bat
+3. Run launcher.bat
+4. In BeamNG, select the map named "BeamNG.Earth"
+
+No additionnal dependencies are required.
+
+## What is BeamNG.Earth
 
 A 1:1 scale, streamed Earth for [BeamNG.drive](https://www.beamng.com/): drive anywhere on the
 planet on real elevation data and satellite imagery, with distance-based level of detail and the
