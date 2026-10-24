@@ -10,6 +10,7 @@ set "PYTHON=%PYDIR%\python.exe"
 set "PYTHONW=%PYDIR%\pythonw.exe"
 set "PYTHONNOUSERSITE=1"
 set "PYTHONUTF8=1"
+call "%~dp0win7\rust_env.bat"
 
 if not exist "%PYTHON%" goto nopython
 
