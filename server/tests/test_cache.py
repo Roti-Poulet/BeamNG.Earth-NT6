@@ -681,6 +681,13 @@ class ServerCacheTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.root, "c2", cachemod.VERSION_FILE)),
                          "Server() alone writes nothing into the cache root")
 
+    def test_share_port(self):
+        """The BeamMP group service's port: this machine's BNGE_SHARE_PORT, else the BeamMP server's, else 47621."""
+        self.assertEqual(earthd.share_port(None, ""), earthd.peerworkmod.SHARE_PORT)
+        self.assertEqual(earthd.share_port(50000, ""), 50000)
+        self.assertEqual(earthd.share_port(50000, "51000"), 51000)
+        self.assertEqual(earthd.share_port(80, "x"), earthd.peerworkmod.SHARE_PORT, "unusable ones skipped")
+
     def test_cli(self):
         self.assertEqual(earthd.parse_cache_cap("12.5"), 12.5)
         self.assertEqual(earthd.parse_cache_cap("0"), 0.0)
@@ -689,6 +696,43 @@ class ServerCacheTest(Base):
             with self.assertRaises(argparse.ArgumentTypeError):
                 earthd.parse_cache_cap(bad)
 
+
+
+class PruneDirTest(unittest.TestCase):
+    def test_oldest_go_first_recent_stay(self):
+        import tempfile, shutil
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        now = 1_000_000.0
+        for i in range(10):
+            p = os.path.join(root, f"d{i % 3}", f"{i}.raw.npy")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+            os.utime(p, (now - 10000 + i * 100, now - 10000 + i * 100))
+        keep = os.path.join(root, "other.npz")
+        with open(keep, "wb") as f:
+            f.write(b"x" * 5000)
+        os.utime(keep, (0, 0))
+        n, left = cachemod.prune_dir(root, 500, keep_s=600, match=lambda n: n.endswith(".raw.npy"), now=now)
+        self.assertEqual((n, left), (6, 400), "down to 90 % of the cap, the oldest first")
+        self.assertTrue(os.path.exists(keep), "files not matched stay")
+        self.assertEqual(sorted(os.listdir(os.path.join(root, "d0"))), ["6.raw.npy", "9.raw.npy"])
+        # a recent file stays even over the cap
+        n, left = cachemod.prune_dir(root, 50, keep_s=10 ** 6, match=lambda n: n.endswith(".raw.npy"), now=now)
+        self.assertEqual(n, 0)
+
+    def test_touch_once(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            path = f.name
+        self.addCleanup(os.remove, path)
+        os.utime(path, (1, 1))
+        cachemod.touch_once(path)
+        self.assertGreater(os.path.getmtime(path), 1000)
+        os.utime(path, (1, 1))
+        cachemod.touch_once(path)
+        self.assertEqual(os.path.getmtime(path), 1, "once per process")
 
 if __name__ == "__main__":
     unittest.main()

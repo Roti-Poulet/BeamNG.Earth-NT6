@@ -64,7 +64,17 @@ SHARE_PORT = 47621              # a player's world server serving its group (Gro
 GROUP_CONNS = 8                 # connections to each group member: its tiles asked for at once
 CACHE_BYTES = 1 << 30           # ReplyCache's disk use at most
 MAX_SLOTS = 32                  # helper connections a requester keeps at most (its far threads: one per slot)
-SETTINGS = ("roads", "grading", "road_widths", "airports", "sea")
+SETTINGS = ("roads", "grading", "road_widths", "airports", "sea", "roads_in_ground")
+
+
+def world_settings(settings):
+    """Canonical worker settings; omitted rendering keeps the 1.6 terrain default."""
+    if not isinstance(settings, dict):
+        raise ValueError("bad world settings")
+    mode = settings.get("roads_in_ground", True)
+    if not isinstance(mode, bool):
+        raise ValueError("bad roads_in_ground")
+    return tuple(mode if k == "roads_in_ground" else bool(settings.get(k)) for k in SETTINGS)
 
 
 # --- identity ----------------------------------------------------------------------------------------------------
@@ -407,7 +417,7 @@ def check_job(h):
     layout = farfield.Layout(_int(lay.get("cells"), 1, 1024, "cells"), _int(lay.get("block"), 1, 1 << 16, "block"),
                              bool(lay.get("mesh")), tuple(tex_px) if tex_px is not None else None)
     s = h.get("settings") or {}
-    settings = tuple(bool(s.get(k)) for k in SETTINGS)
+    settings = world_settings(s)
     kw = dict(lat=lat, lon=lon, tile=tile, zoom=zoom, q=q, ref_zoom=ref_zoom, with_sink=bool(h.get("with_sink")),
               layout=layout)
     if op == "far_tile":
@@ -477,11 +487,11 @@ class Helper:
             p = self.pools.get(settings)
             if p is None:
                 ctx = multiprocessing.get_context("spawn")
-                roads, grading, widths, airports, sea = settings
+                roads, grading, widths, airports, sea, roads_in_ground = settings
                 p = self.pools[settings] = pools.RespawningPool(
                     "peer far tile", self.workers, mp_context=ctx, initializer=blockworker.init,
                     initargs=(self.cache_dir, False, roads, grading and roads, widths and roads, False,
-                              ctx.Queue(maxsize=1), logging.getLogger().level, airports, sea))
+                              ctx.Queue(maxsize=1), logging.getLogger().level, airports, sea, 0, roads_in_ground))
                 log.info("helper: worker pool for settings %s (%d processes)", dict(zip(SETTINGS, settings)),
                          self.workers)
             return p
@@ -804,7 +814,7 @@ class SharedFarPool:
     def serve(self, h, aid_for, out_dir):
         """GroupHelper: a member's request h (a checked header). -> (header, blobs)"""
         op, settings, kw = check_job(h)
-        if settings != tuple(bool(self.settings.get(k)) for k in SETTINGS):
+        if settings != world_settings(self.settings):
             raise ValueError("other world settings")
         key = job_key(h)
         need = (kw["tex"]["px"], kw["tex"]["mask_px"]) if op == "far_tile" else None

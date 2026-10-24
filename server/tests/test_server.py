@@ -1229,3 +1229,38 @@ class PredictTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerfLogTest(ServerHarness):
+    """The mod's performance log (perflog.lua): its lines go into the server's log, cut to size."""
+
+    def test_lines_logged(self):
+        self.hello()
+        with self.assertLogs("earthd", level="INFO") as cm:
+            self.c.send({"type": "perf_log", "lines": ["perf hitch 412 ms at 39.28345,-76.59341, 52 mph",
+                                                       "x" * 5000, 7, "two\nlines"] + ["more"] * 100})
+            self.c.send({"type": "pose", "anchorId": 1, "x": 0, "y": 0, "z": 0})     # (after the perf_log)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and sum("game: " in r for r in cm.output) < 39:
+                time.sleep(0.05)
+        got = [r.split("game: ", 1)[1] for r in cm.output if "game: " in r]
+        self.assertEqual(got[0], "perf hitch 412 ms at 39.28345,-76.59341, 52 mph")
+        self.assertEqual(len(got[1]), 2000, "a line cut to PERF_LOG_CHARS")
+        self.assertEqual(got[2], "two lines", "one log line each, not a number")
+        self.assertEqual(len(got), 39, "the first PERF_LOG_LINES entries of a message, the number among them left out")
+
+
+class LoadProgressTest(ServerHarness):
+    """The loading line's counts (Connection.send_progress): [done, wanted] of the road, tree and far tiles after a pose."""
+
+    def test_progress_after_a_pose(self):
+        self.hello()
+        aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
+        self.c.send({"type": "commit_anchor", "anchorId": aid})
+        self.pose(aid, 0.0, 0.0)
+        m, _ = self.c.until(lambda m: m["type"] == "load_progress", timeout=30)
+        self.assertEqual(m["anchorId"], aid)
+        for k in ("ground", "roads", "trees", "far"):
+            self.assertEqual(len(m[k]), 2)
+            self.assertTrue(0 <= m[k][0] <= m[k][1], k)
+        self.assertGreater(m["far"][1], 0, "far tiles wanted round the player")

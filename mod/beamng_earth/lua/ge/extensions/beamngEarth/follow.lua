@@ -40,6 +40,13 @@ M.FAST_V_1024 = 1e9                          -- no fast mode
 M.GRID_512 = 128
 M.PREPARE_DIST_512 = 128
 M.COMMIT_DIST_512 = 192
+-- The next block's centre at least MIN_LEAD ahead of a moving player (M.target): at town speeds LOOKAHEAD_S put it one
+-- grid step ahead, a move every 128 m, each a ~50 ms frame and a redraw of the sun's shadow map on a Steam Deck
+-- (2026-10-23, 17 of 21 such redraws on a Baltimore drive); 256 m halves the moves at 16-67 mph, the player still
+-- >= 229 m inside the edge in the offline model (the user: "you can try letting it get closer to the edge")
+M.MIN_LEAD_512 = 256        -- the next block's centre at least this far ahead of a moving player (M.target)
+M.MIN_LEAD_1024 = 0
+M.MIN_LEAD_V = 2            -- (moving: faster than this, m/s)
 M.HARD_COMMIT_DIST_512 = 320
 M.EDGE_MARGIN_512 = 250
 M.REACH_512 = 510 - M.EDGE_MARGIN_512        -- 260 m; the collidable east/north edge is at +510
@@ -65,6 +72,7 @@ M.HALF = lattice.HALF          -- block SW corner = centre - HALF
 M.GRID = M.GRID_1024           -- block centres snap to this grid
 M.PREPARE_DIST = M.PREPARE_DIST_1024         -- Chebyshev distance player -> centre that requests a new terrain
 M.COMMIT_DIST = M.COMMIT_DIST_1024           -- ... that commits a ready one (once its uncovered strip is live)
+M.MIN_LEAD = M.MIN_LEAD_1024
 M.HARD_COMMIT_DIST = M.HARD_COMMIT_DIST_1024 -- ... that commits a ready one regardless (still >= 320 m from the edge)
 M.EDGE_MARGIN = M.EDGE_MARGIN_1024           -- the new centre keeps the player at least this far from every edge
 M.LOOKAHEAD_S = M.LOOKAHEAD_S_1024           -- target = snap256(player + velocity * LOOKAHEAD_S)
@@ -85,6 +93,7 @@ function M.configure(size)
   local t = n == 512 and '_512' or '_1024'
   M.SIZE, M.HALF = n, n * M.SQUARE_SIZE / 2
   M.GRID, M.PREPARE_DIST, M.COMMIT_DIST = M['GRID' .. t], M['PREPARE_DIST' .. t], M['COMMIT_DIST' .. t]
+  M.MIN_LEAD = M['MIN_LEAD' .. t]
   M.HARD_COMMIT_DIST, M.EDGE_MARGIN, M.REACH = M['HARD_COMMIT_DIST' .. t], M['EDGE_MARGIN' .. t], M['REACH' .. t]
   M.LOOKAHEAD_S, M.RECHECK_S, M.FAST_MODE_V = M['LOOKAHEAD_S' .. t], M['RECHECK_S' .. t], M['FAST_V' .. t]
   REACH = M.REACH
@@ -131,7 +140,16 @@ end
 -- Centre of the next block for a player at (px, py) moving at (vx, vy) m/s.
 function M.target(px, py, vx, vy)
   local t, reach = mode(vx, vy)
-  return M.centreNear(px + (vx or 0) * t, py + (vy or 0) * t, px, py, reach)
+  local lx, ly = (vx or 0) * t, (vy or 0) * t
+  -- at town speeds LOOKAHEAD_S puts the next block one grid step ahead: a move every 128 m; at least MIN_LEAD ahead
+  -- (while moving), every move goes about twice as far
+  local v2 = (vx or 0) * (vx or 0) + (vy or 0) * (vy or 0)
+  local l2 = lx * lx + ly * ly
+  if M.MIN_LEAD > 0 and v2 > M.MIN_LEAD_V * M.MIN_LEAD_V and l2 < M.MIN_LEAD * M.MIN_LEAD then
+    local k = M.MIN_LEAD / math.sqrt(v2)
+    lx, ly = vx * k, vy * k
+  end
+  return M.centreNear(px + lx, py + ly, px, py, reach)
 end
 
 -- Seconds until a player at (px, py) moving at (vx, vy) is `dist` (Chebyshev) from (cx, cy)
@@ -164,6 +182,16 @@ end
 --   latency: the last measured heightmap latency, s (the 512² re-check; nil = LATENCY_S)
 -- Returns 'prepare' (+ new cx, cy), 'commit', 'discard' or nil. 'commit' is a request: the caller
 -- runs it in a governor heavy slot (governor.lua), so it may be returned on several frames.
+-- Pure: is the block's centre still ahead of a player moving at town speed, the target set by MIN_LEAD (decide)?
+function M.centreAhead(px, py, vx, vy, cx, cy)
+  vx, vy = vx or 0, vy or 0
+  local v2 = vx * vx + vy * vy
+  if M.MIN_LEAD <= 0 or v2 <= M.MIN_LEAD_V * M.MIN_LEAD_V or v2 * M.LOOKAHEAD_S * M.LOOKAHEAD_S >= M.MIN_LEAD * M.MIN_LEAD then
+    return false
+  end
+  return (cx - px) * vx + (cy - py) * vy > 0 and M.cheb(px, py, cx, cy) <= M.MIN_LEAD + M.GRID
+end
+
 function M.decide(px, py, vx, vy, cx, cy, pending, now, retryAt, gate, latency)
   if not cx then return nil end
   local _, reach, ahead = mode(vx, vy)
@@ -176,8 +204,12 @@ function M.decide(px, py, vx, vy, cx, cy, pending, now, retryAt, gate, latency)
       -- 512² commit-time re-check (see the top): a block the player would soon need to replace is
       -- re-prepared instead, while there is time for that
       -- (the latency is at least LATENCY_S: the last measured one says little about the next request)
+      -- (not where MIN_LEAD sets the target: the block is then that far ahead by design, and the box test, symmetric,
+      -- took it for one the player would soon leave: ready blocks thrown away and asked again at town speeds)
       local r = M.RECHECK_S
-      if r > 0 and ahead == 0 and d <= M.HARD_COMMIT_DIST
+      local lt = M.LOOKAHEAD_S
+      local leadSet = M.MIN_LEAD > 0 and ((vx or 0) ^ 2 + (vy or 0) ^ 2) * lt * lt < M.MIN_LEAD * M.MIN_LEAD
+      if r > 0 and ahead == 0 and not leadSet and d <= M.HARD_COMMIT_DIST
         and M.cheb(px + (vx or 0) * r, py + (vy or 0) * r, pending.cx, pending.cy) > M.PREPARE_DIST
         and M.timeTo(px, py, vx or 0, vy or 0, cx, cy, M.RECHECK_SAFE)
           > max(latency or M.LATENCY_S, M.LATENCY_S) + M.RECHECK_SLACK_S
@@ -210,6 +242,9 @@ function M.decide(px, py, vx, vy, cx, cy, pending, now, retryAt, gate, latency)
   if M.cheb(px + (vx or 0) * ahead, py + (vy or 0) * ahead, cx, cy) <= M.PREPARE_DIST or now < (retryAt or 0) then
     return nil
   end
+  -- (MIN_LEAD: the block just committed is centred ahead of the player; the box test, symmetric, asked for the next one
+  -- at once, and a prediction made then was overtaken by the bend: the next one once the player is past this centre)
+  if M.centreAhead(px, py, vx, vy, cx, cy) then return nil end
   local tx, ty = M.target(px, py, vx, vy)
   if tx == cx and ty == cy then return nil end -- heading back towards the centre: nothing to gain
   return 'prepare', tx, ty

@@ -7,7 +7,7 @@
   "description": "Street, town and country, and the world loading (BeamNG.Earth).",
   "css": {
     "top": "0px",
-    "height": "32px",
+    "height": "64px",
     "width": "700px"
   },
   "author": "BeamNG.Earth",

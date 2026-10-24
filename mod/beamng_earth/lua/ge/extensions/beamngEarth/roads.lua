@@ -74,6 +74,12 @@ M.URGENT_EVERY_FRAMES = 3
 -- it for good (in-game 2026-10-19, once the urgent rebuilds above made that coincidence common).
 M.SWAP_QUIET_FRAMES = 3
 M.SWAP_QUIET_MS = 150
+-- A collision rebuild (be:reloadCollision, ~10-25 ms on a Steam Deck) in a frame that already spent RELOAD_ROOM_MS on
+-- imports waits for the next frame, RELOAD_WAIT_FRAMES at most, unless the car is held over a collider (holdActive):
+-- an urgent import, another and the rebuild made 70-80 ms frames on a Deck's Baltimore drive (2026-10-23)
+M.RELOAD_ROOM_MS = 8.0
+M.RELOAD_WAIT_FRAMES = 3
+local reloadWaits = 0
 
 local newColliders = {}    -- { id, walkQ entry } of the colliders made since the last reloadCollision
 local parked = {}          -- walkQ entries of colliders whose tile is not near enough yet
@@ -735,8 +741,14 @@ function M.update(gov, currentAnchor, player, view)
     if swapQuiet.frames <= 0 and swapQuiet.since() >= M.SWAP_QUIET_MS then swapQuiet = nil end
   end
   local urgent = collisionDirty and (holdActive or M.urgentColliders()) and sinceReload() > M.URGENT_GAP_S * 1000
-  if not swapQuiet and ((collisionDirty and sinceReload() > M.RELOAD_EVERY_S * 1000) or urgent
-      or (deletesDirty and sinceReload() > M.RELOAD_DELETES_S * 1000)) then
+  local due = not swapQuiet and ((collisionDirty and sinceReload() > M.RELOAD_EVERY_S * 1000) or urgent
+      or (deletesDirty and sinceReload() > M.RELOAD_DELETES_S * 1000))
+  if due and not holdActive and reloadWaits < M.RELOAD_WAIT_FRAMES and gov.roomFor and not gov:roomFor(M.RELOAD_ROOM_MS) then
+    reloadWaits = reloadWaits + 1
+    due = false
+  end
+  if due then
+    reloadWaits = 0
     local t0 = now()
     noteNewColliders()
     be:reloadCollision()

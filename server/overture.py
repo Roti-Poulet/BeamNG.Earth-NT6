@@ -221,6 +221,9 @@ class StacIndex:
         return out
 
 
+META_FILES = 2048        # files whose parsed Parquet metadata Reader keeps (a few hundred row groups each)
+
+
 class Reader:
     """Overture layers per cell (see the module docstring). threads: DuckDB threads per query."""
 
@@ -230,6 +233,10 @@ class Reader:
         self._remotes = OrderedDict()
         self._lock = threading.Lock()
         self.pool = ThreadPoolExecutor(FETCH_THREADS, thread_name_prefix="mapdata-fetch")
+        # path -> [(row group, {"first", "n", "bbox", "cols"})]: a file's parsed Parquet metadata (_plan; a release's
+        # files never change). Re-reading it for every cell was most of a map cell's CPU (the Deck's mapdata-layer
+        # thread, 36 CPU-s of a teleport, 2026-10-23); osmtags._groups keeps its file's the same way.
+        self._meta = OrderedDict()
 
     def close(self):
         self.pool.shutdown(wait=False)
@@ -367,25 +374,44 @@ class Reader:
                 r.read(r.size - n - 8, r.size, kind)
         self._parallel([lambda r=files[p]: footer(r) for p in paths])
         uris = ", ".join(f"'{proto}://{p}'" for p in paths)
-        meta = con.execute(f"""SELECT file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min,
-            stats_max, dictionary_page_offset, data_page_offset, total_compressed_size
-            FROM parquet_metadata([{uris}]) ORDER BY file_name, row_group_id, column_id""").fetchall()
-        groups = {}                     # (path, rg) -> {"first": row, "bbox": {leaf: (min, max)}, "cols": {top: [range]}}
-        next_row = {}
-        for fname, rg, nrows, col, smin, smax, dict_off, data_off, size in meta:
-            path = fname.split("://", 1)[-1]
-            g = groups.get((path, rg))
-            if g is None:
-                first = next_row.get(path, 0)
-                next_row[path] = first + nrows
-                g = groups[(path, rg)] = {"first": first, "n": nrows, "bbox": {}, "cols": {}}
-            offs = [o for o in (dict_off, data_off) if o]
-            if not offs:
-                continue
-            top, leaf = col.split(", ")[0], col.split(", ")[-1]
-            g["cols"].setdefault(top, []).append((min(offs), min(offs) + size))
-            if top == "bbox":
-                g["bbox"][leaf] = (smin, smax)
+        with self._lock:
+            new = [p for p in paths if p not in self._meta]
+        if new:
+            meta = con.execute(f"""SELECT file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min,
+                stats_max, dictionary_page_offset, data_page_offset, total_compressed_size
+                FROM parquet_metadata([{", ".join(f"'{proto}://{p}'" for p in new)}])
+                ORDER BY file_name, row_group_id, column_id""").fetchall()
+            parsed = {}                 # path -> {rg: {"first": row, "n", "bbox": {leaf: (min, max)}, "cols": {top: [range]}}}
+            next_row = {}
+            for fname, rg, nrows, col, smin, smax, dict_off, data_off, size in meta:
+                path = fname.split("://", 1)[-1]
+                pg = parsed.setdefault(path, {})
+                g = pg.get(rg)
+                if g is None:
+                    first = next_row.get(path, 0)
+                    next_row[path] = first + nrows
+                    g = pg[rg] = {"first": first, "n": nrows, "bbox": {}, "cols": {}}
+                offs = [o for o in (dict_off, data_off) if o]
+                if not offs:
+                    continue
+                top, leaf = col.split(", ")[0], col.split(", ")[-1]
+                g["cols"].setdefault(top, []).append((min(offs), min(offs) + size))
+                if top == "bbox":
+                    g["bbox"][leaf] = (smin, smax)
+            with self._lock:
+                for p in new:
+                    self._meta[p] = parsed.get(p, {})
+                while len(self._meta) > META_FILES:
+                    self._meta.popitem(last=False)
+        with self._lock:
+            groups = {}                 # (path, rg) -> {"first": row, "bbox": {leaf: (min, max)}, "cols": {top: [range]}}
+            for p in paths:
+                pg = self._meta.get(p)
+                if pg is None:          # (evicted meanwhile by another thread's files: read again next time)
+                    continue
+                self._meta.move_to_end(p)
+                for rg, g in pg.items():
+                    groups[(p, rg)] = g
 
         def stat(g, leaf, i, default):
             try:
@@ -409,12 +435,15 @@ class Reader:
         firsts = {}
         for (path, rg), g in sorted(groups.items()):
             firsts.setdefault(path, []).append((g["first"], rg))
-        matched = set()
+        rows_of = {}
         for fname, row in hits:
+            rows_of.setdefault(fname, []).append(row)
+        matched = set()
+        for fname, rows in rows_of.items():     # (each file's rows at once: one search per hit was ~0.1 s a cell)
             path = fname.split("://", 1)[-1]
             rgs = firsts[path]
-            k = int(np.searchsorted([f for f, _ in rgs], row, side="right")) - 1
-            matched.add((path, rgs[k][1]))
+            ks = np.searchsorted(np.array([f for f, _ in rgs]), np.asarray(rows), side="right") - 1
+            matched.update((path, rgs[int(k)][1]) for k in np.unique(ks))
         used = set(re.findall(r"[A-Za-z_]+", spec["cols"] + " " + spec.get("extra", ""))) | BASE_COLUMNS
         wanted = {}
         for path, rg in sorted(matched):

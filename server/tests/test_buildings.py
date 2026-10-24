@@ -832,3 +832,56 @@ class CurvatureTest(unittest.TestCase):
         b = Feats(["P", "K"], [ll(10, 10, 30, 30), ll(100, 100, 10, 10)], **{"class": ["", ""], "height": [0.01, 0.2]})
         items = bld.tile_buildings(f, 0.0, 0.0, 256.0, 256.0, [b], lambda la, lo: np.full(np.shape(la), 5.0))
         self.assertEqual([round(bld._area2(s.ring) / 2) for s, _, _ in items], [100], "the plaza left out, the 0.2 m one kept")
+
+
+class PhotoMaskTest(unittest.TestCase):
+    """photo_mask: the buildings over a ground photo's square, grown; one piece per id across the cells."""
+
+    def setUp(self):
+        import geodesy
+        self.f = geodesy.EnuFrame(39.28, -76.59)
+
+    def cell(self, ids, boxes, heights):
+        import mapgeom
+        coords, coord_off = [], [0]
+        for x, y, w, d in boxes:
+            e = np.array([x, x + w, x + w, x, x], float); n = np.array([y, y, y + d, y + d, y], float)
+            la, lo, _ = self.f.enu_to_geodetic(e, n, 0.0)
+            coords.extend(zip(lo, la))
+            coord_off.append(len(coords))
+        k = len(ids)
+        return mapgeom.Features(layer="buildings", ids=np.array(ids), kind=np.full(k, mapgeom.POLYGON, np.uint8),
+                                part_off=np.arange(k + 1, dtype=np.int64), ring_off=np.arange(k + 1, dtype=np.int64),
+                                coord_off=np.array(coord_off, np.int64), lonlat=np.array(coords, np.float64),
+                                attrs={"height": np.array(heights, np.float64)})
+
+    def mask(self, cells):
+        class MD:
+            calls = 0
+
+            def cell(self, key, layers=None, kind=None):
+                c = cells[min(MD.calls, len(cells) - 1)]
+                MD.calls += 1
+                return type("C", (), {"layers": {"buildings": c}})()
+        return bld.photo_mask(self.f, 0.0, 0.0, 512.0, 512, MD())
+
+    def at(self, m, e, n):
+        return bool(m[int(512 - n), int(e)])      # (row 0 = north, 1 m a pixel)
+
+    def test_inside_drawn_outside_not(self):
+        a = self.cell(["A", "B", "C"], [(100, 100, 20, 20), (2000, 2000, 20, 20), (505, 300, 30, 10)], [8, 8, np.nan])
+        m = self.mask([a])
+        self.assertTrue(self.at(m, 110, 110), "inside")
+        self.assertTrue(self.at(m, 98, 110), "grown by its edge and lean (1.5 m + 12 % of 8 m)")
+        self.assertFalse(self.at(m, 95, 110))
+        self.assertTrue(self.at(m, 508, 305), "one across the square's edge")
+        self.assertIsNone(self.mask([self.cell(["B"], [(2000, 2000, 20, 20)], [8])]), "none over the square")
+
+    def test_one_piece_per_id(self):
+        first = self.cell(["A", "A"], [(100, 100, 20, 20), (300, 300, 20, 20)], [8, 8])
+        second = self.cell(["A", "D"], [(200, 200, 20, 20), (400, 100, 20, 20)], [8, 8])
+        m = self.mask([first, second])
+        self.assertTrue(self.at(m, 110, 110), "the first cell's first piece")
+        self.assertFalse(self.at(m, 310, 310), "not a second row of the same id")
+        self.assertFalse(self.at(m, 210, 210), "nor another cell's piece of it")
+        self.assertTrue(self.at(m, 410, 110), "the next building")

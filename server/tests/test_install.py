@@ -127,6 +127,48 @@ class ModActive(unittest.TestCase):
             self.assertFalse(install.ensure_mod_active(d))
 
 
+class RunningGameReload(unittest.TestCase):
+    """reload_running_game: the one-shot script written to the user folder, the reload sent through the game's pipe;
+    with no game to take it, the script removed again."""
+
+    def files(self, d):
+        return [os.path.join(d, *rel.split("/")) for rel in install.RELOADED_FILES]
+
+    def test_sent_keeps_the_script(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(install, "send_game_command",
+                                                                   return_value=True) as send:
+            self.assertTrue(install.reload_running_game(d))
+            send.assert_called_once_with(install.RELOAD_COMMAND)
+            for path in self.files(d):
+                self.assertTrue(os.path.isfile(path), path)
+            install.clear_reload_files(d)
+            for path in self.files(d):
+                self.assertFalse(os.path.exists(path), path)
+            self.assertFalse(os.path.exists(os.path.join(d, "scripts", "beamng_earth_reload")))
+
+    def test_no_game_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(install, "send_game_command", return_value=False):
+            self.assertFalse(install.reload_running_game(d))
+            for path in self.files(d):
+                self.assertFalse(os.path.exists(path), path)
+
+    @unittest.skipIf(os.name == "nt", "a FIFO")
+    def test_pipe_without_a_reader_does_not_block(self):
+        with tempfile.TemporaryDirectory() as d:
+            fifo = os.path.join(d, "pipe")
+            os.mkfifo(fifo)
+            with mock.patch.object(install, "GAME_PIPE", fifo):
+                self.assertFalse(install.send_game_command(b"v1/x"), "no game reading: refused, not waiting")
+                r = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    self.assertTrue(install.send_game_command(b"v1/x"))
+                    self.assertEqual(os.read(r, 100), b"v1/x")
+                finally:
+                    os.close(r)
+            with mock.patch.object(install, "GAME_PIPE", os.path.join(d, "none")):
+                self.assertFalse(install.send_game_command(b"v1/x"))
+
+
 class ModUpdateTimes(unittest.TestCase):
     """The game repacks a terrain texture (seconds, on its main thread) when the file is newer than its cache entry:
     an update keeps an unchanged file's time and gives a changed one the current time."""

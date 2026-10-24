@@ -48,6 +48,7 @@ local ui = require('beamngEarth/ui')
 local settings = require('beamngEarth/settings') -- the pause-menu page's values (docs/DEVTOOLS.md)
 local credits = require('beamngEarth/credits') -- the on-screen data credits (docs/DEVTOOLS.md)
 local statusbar = require('beamngEarth/statusbar') -- the slim bar at the top: street, place, loading, fps
+local loadprogress = require('beamngEarth/loadprogress') -- the bar's loading line after a teleport
 local places = require('beamngEarth/places') -- saved and recent places (the settings page)
 local levelinfo = require('beamngEarth/levelinfo') -- the level select's spawn points: the places, Random
 local banner = require('beamngEarth/banner') -- the connection banner (docs/DEVTOOLS.md)
@@ -80,6 +81,7 @@ local beammp = require('beamngEarth/beammp')           -- BeamMP sessions: the i
 local mpsession = require('beamngEarth/mpsession')     -- BeamMP sessions (the plugin's anchors, damage, joining)
 local mpanchor = require('beamngEarth/mpanchor')       -- BeamMP: other players' positions into our frame (PR #88)
 local seasonlook = require('beamngEarth/seasonlook')   -- the trees' leaves in the season (hello.season) -- the AI road graph for the stock traffic and AI (map.reset)
+local perflog = require('beamngEarth/perflog')         -- hitches and frame-rate drops into server.log (perflog.lua)
 
 local LEVEL_ID = 'beamng_earth'
 local MOD_VERSION = '0.4.0'
@@ -132,6 +134,7 @@ local updateHidden = false   -- the notice closed for this session (its releases
 local cacheClears = 0         -- answers to a clear so far (the settings page waits for the next one)
 
 local function resetState()
+  loadprogress.reset()
   st = {
     inOurLevel = false,
     active = false,          -- world logic running (rebase, far field, sky, pose)
@@ -735,6 +738,8 @@ local function onMessage(msg)
     st.serverBacklog = tonumber(msg.backlog)
     -- M1h: the far-field radius rides on every status in horizon mode (the view distance follows it)
     if msg.radius ~= nil then M.setFarRadius(msg.radius) end
+  elseif t == 'load_progress' then      -- the loading line's counts (server Connection.send_progress)
+    st.loadProgress = msg
   elseif t == 'share' then              -- our world server serving our BeamMP group (mpsession.lua, peerwork.py)
     pcall(mpsession.onShare, msg)
   elseif t == 'terrain_patch' then
@@ -953,14 +958,10 @@ M.dropHoldState = function() return dropHold end      -- (tests, tools)
 -- The game's own pause (simTimeAuthority, what the pause key does): holding the car by setting its position every frame
 -- strained it (its damage rose 0 -> 93k in 7 s of holding, the user 2026-10-18: "the hold seems to damage my car",
 -- "can you use the actual pause system"). Resumed only if the hold paused it; the player resuming it ends the hold.
-local function simPause(on)
-  local sta = rawget(_G, 'simTimeAuthority')
-  if sta and sta.pause then sta.pause(on) end
-end
-local function simPaused()
-  local sta = rawget(_G, 'simTimeAuthority')
-  return sta and sta.getPause and sta.getPause() or false
-end
+-- (in a BeamMP session: our own car held, not every car on the screen: simhold.lua)
+local simhold = require('beamngEarth/simhold')
+local function simPause(on) simhold.pause(on) end
+local function simPaused() return simhold.paused() end
 
 local function setCarAt(veh, x, y, z)
   -- the cluster moves by the reference node: set it where it is relative to the vehicle's position, at the target
@@ -996,6 +997,7 @@ local function updateDropHold(dt)
   if not st.paused and drophold.observe(h, pl.x, pl.y, pl.z, pl.speed, dt, st.anchorId, box, busy, nearReady) == 'start' then
     log('I', 'beamngEarth', string.format('drop hold: the car is %.0f m from the block; paused until its ground, bridges ' ..
       'and buildings load', box and math.max(box[1] - pl.x, pl.x - box[3], box[2] - pl.y, pl.y - box[4], 0) or -1))
+    loadprogress.start(st.clock)    -- a jump the mod did not make (F7, the world editor): the bar says "Loading" too
     if not simPaused() then
       simPause(true)
       h.pausedByUs = true
@@ -1029,6 +1031,7 @@ local function updateDropHold(dt)
   local act, z = drophold.step(h, st.clock, box, serial, gz, building, near)
   if act == nil then return end
   if act == 'place' then
+    if simhold.carHeld() then simPause(false) end     -- (BeamMP: the car active again before it is placed)
     setCarAt(veh, h.x, h.y, z)
     log('I', 'beamngEarth', string.format('drop hold: set on the ground at %.1f', z))
   elseif act == 'timeout' then
@@ -1143,6 +1146,10 @@ local function updateWorld(dt)
     st.pending = nil -- the next frame prefetches at the player's position
   end
 
+  -- an unstable car (NaN position or speed, the frames before the game resets it): no block asked for from it (the
+  -- server refused "cx is not finite", a Steam Deck test drive 2026-10-23)
+  local function finite(v) return type(v) == 'number' and v == v and v > -math.huge and v < math.huge end
+  if not (finite(pl.x) and finite(pl.y) and finite(pl.vx or 0) and finite(pl.vy or 0)) then return end
   -- terrain-follow, unless the altitude rule holds the block (high above the ground)
   local ga = st.groundAhead
   local gz = ga and ga.anchorId == st.anchorId and st.clock - ga.at <= follow.GROUND_STALE_S and ga.z or nil
@@ -1309,11 +1316,35 @@ end
 -- attribution line. Called every frame then, so no farfield.stats() table: its counters only.
 local function creditsFallback() return attributionText(farfield.counters()) end
 
+-- The status bar's loading part (loadprogress.lua): false when no load is on; worked out at most every LOAD_LINE_S.
+local LOAD_LINE_S = 0.25
+local loadLineAt, loadLineText = -math.huge, false
+local function loadLine()
+  if not loadprogress.active() then return false end
+  if st.clock - loadLineAt < LOAD_LINE_S then return loadLineText end
+  loadLineAt = st.clock
+  local p = st.pending
+  local placed = st.anchor ~= nil and not (p and (p.purpose == 'teleport' or p.purpose == 'resync'))
+    and st.placeFrames == nil and not dropHold.active
+  local lp = st.loadProgress
+  local pend = {}
+  local okR, rs = pcall(roads.status)
+  if okR and rs then pend.roads = (rs.queued or 0) + (rs.walksQueued or 0) end
+  local okT, ts = pcall(trees.status)
+  if okT and ts then pend.trees = ts.pending or 0 end
+  local okF, fs = pcall(farfield.stats)
+  if okF and fs then pend.far = fs.queued or 0 end
+  loadLineText = loadprogress.line(st.clock, { placed = placed,
+    progress = lp and lp.anchorId == st.anchorId and lp or nil, pending = pend }) or false
+  return loadLineText
+end
+
 -- The UI apps' texts (hudapps.update calls it at most every SEND_S while an app is on screen).
 local hudInput = { banner = nil }
 local function hudTexts()
   local shown = st.inOurLevel and st.active
-  hudInput.status = shown and statusbar.enabled and statusbar.text(st.status) or ''
+  hudInput.status = shown and statusbar.enabled and statusbar.text(st.status, loadLine()) or ''
+  hudInput.loading = shown and statusbar.enabled and statusbar.loading(st.status, loadLine()) or ''
   hudInput.credits = st.active and credits.enabled and credits.text(creditsFallback) or ''
   hudInput.banner = (st.inOurLevel or st.active) and banner.enabled and banner.current() or nil
   hudInput.hidden = credits.hiddenByUi()
@@ -1374,7 +1405,15 @@ end
 local beammpBroken = false   -- an error in the BeamMP window turns it off for the session
 local mpsessionBroken = false -- the same for the BeamMP session by area (mpsession.lua)
 -- the minimap's label (hudapps.hookCityZone)
-local function minimapName() return hudapps.minimapName(statusbar.location()) end
+-- (the car's coordinates, formatted again only when they change at the label's 5 decimals)
+local coordsKey, coordsText = nil, nil
+local function minimapName()
+  local p = st.player
+  if not (p and p.lat and p.lon) then return hudapps.minimapName(statusbar.location()) end
+  local k = math.floor(p.lat * 1e5 + 0.5) * 1e7 + math.floor(p.lon * 1e5 + 0.5)
+  if k ~= coordsKey then coordsKey, coordsText = k, hudapps.coordsLabel(p.lat, p.lon) end
+  return coordsText
+end
 -- the minimap compass's true north at the camera (hudapps.hookMinimapNorth)
 local function minimapNorth()
   if not st.anchor then return nil end
@@ -1389,7 +1428,7 @@ local function drawUi(dt)
   updateBanner(dt)
   if not hudapps.mounted('banner') then banner.draw(st.inOurLevel or st.active, credits.hiddenByUi()) end
   if not hudapps.mounted('status') then
-    statusbar.draw(st.inOurLevel and st.active, credits.hiddenByUi(), st.status)
+    statusbar.draw(st.inOurLevel and st.active, credits.hiddenByUi(), st.status, loadLine())
   end
   hudapps.update(st.clock or 0, hudTexts)
   if st.inOurLevel then
@@ -1443,6 +1482,91 @@ local function noteHitch(frameMs)
   end
   hitches[#hitches + 1] = h
   if #hitches > M.HITCH_KEEP then table.remove(hitches, 1) end
+  return h
+end
+
+-- The performance log (perflog.lua): where the player is and what the mod is doing, for its lines.
+local perfMetrics = {}
+local function perfEngine()
+  local dbg = Engine and Engine.Debug
+  if not (dbg and dbg.getLastPerformanceMetrics) then return nil end
+  for k in pairs(perfMetrics) do perfMetrics[k] = nil end
+  if not pcall(dbg.getLastPerformanceMetrics, perfMetrics) then return nil end
+  local out = {}
+  for k, v in pairs(perfMetrics) do
+    if type(v) == 'number' and not k:find('^phys') and not k:find('^virt') then out[k] = v end
+  end
+  return out
+end
+local function perfContext()
+  local c = {}
+  local p = st.player
+  if p then
+    c.lat, c.lon = p.lat, p.lon
+    c.mph = math.sqrt((p.vx or 0) ^ 2 + (p.vy or 0) ^ 2) * 2.23694
+  end
+  if st.block then c.block = string.format('%d,%d', st.block.cx, st.block.cy) end
+  local s = {}
+  if dropHold.active then s[#s + 1] = 'held until its ground loads' end
+  if st.guard and st.guard.pausedByUs then s[#s + 1] = 'held at the edge of the ground' end
+  if st.rebasing then s[#s + 1] = 'moving the world origin' end
+  if st.clock < (st.loadingUntil or 0) or st.placeFrames then s[#s + 1] = 'loading after a teleport' end
+  if not net.isConnected() then s[#s + 1] = 'world server not connected' end
+  if beammp.inSession() then s[#s + 1] = 'BeamMP' end
+  c.state = table.concat(s, ', ')
+  local d = {}
+  if st.commitFrames then d[#d + 1] = 'ground block swap' end
+  if st.terrainPending and st.terrainPending.sentAt then
+    d[#d + 1] = string.format('next block asked %.1fs ago', st.clock - st.terrainPending.sentAt)
+  end
+  local okF, fs = pcall(farfield.stats)
+  if okF and fs then
+    if (fs.queued or 0) > 0 then d[#d + 1] = 'far tiles ' .. fs.queued .. ' queued' end
+    if not fs.done then d[#d + 1] = 'far field loading' end
+  end
+  local okR, rs = pcall(roads.status)
+  if okR and rs and ((rs.queued or 0) + (rs.walksQueued or 0)) > 0 then
+    d[#d + 1] = 'road tiles ' .. ((rs.queued or 0) + (rs.walksQueued or 0)) .. ' queued'
+  end
+  local okT, ts = pcall(trees.status)
+  if okT and ts and (ts.pending or 0) > 0 then d[#d + 1] = 'tree tiles ' .. ts.pending .. ' pending' end
+  if (st.serverBacklog or 0) > 0 then d[#d + 1] = 'server backlog ' .. st.serverBacklog end
+  c.doing = table.concat(d, ', ')
+  c.extra = string.format('Lua %.0f MB%s', collectgarbage('count') / 1024,
+    st.terrainLatency and string.format(', last block %.1fs', st.terrainLatency) or '')
+  return c
+end
+local machineSent = false       -- the machine's lines sent to this server connection
+local machineTryAt = nil
+local function perfMachine()
+  local rep = rawget(_G, 'beamngEarth_report')
+  local okH, hw = pcall(function() return rep and rep.collectHardware and rep.collectHardware() end)
+  if not okH or not hw then return {} end
+  local okF, md = pcall(require('beamngEarth/issuefmt').formatHardware, hw)
+  if not okF or type(md) ~= 'table' then return {} end
+  local out = {}
+  for _, l in ipairs(md) do                -- its Markdown list lines, without the list and bold marks
+    local item = type(l) == 'string' and l:match('^%- (.*)$')
+    if item then out[#out + 1] = 'machine: ' .. (item:gsub('%*%*', '')) end
+  end
+  return out
+end
+local function perfFrame(ms, hrec)
+  local lines = perflog.frame(ms, st.clock, perfContext, hrec, marks, perfEngine)
+  if not net.isConnected() then
+    machineSent = false
+  elseif not machineSent and st.clock >= (machineTryAt or 0) then
+    local m = perfMachine()
+    if #m > 0 then
+      machineSent = true
+      net.send({ type = 'perf_log', lines = m })
+    else
+      machineTryAt = st.clock + 10           -- (the game's report extension not loaded yet)
+    end
+  end
+  if #lines == 0 then return end
+  for _, l in ipairs(lines) do log('I', 'beamngEarth', l) end
+  if net.isConnected() then net.send({ type = 'perf_log', lines = lines }) end
 end
 -- The hitches since the last call: [{ms, at (s), mod = {part = ms}, engine = {subsystem = ms}}].
 function M.hitches()
@@ -1473,7 +1597,15 @@ local function onUpdate(dtReal, dtSim)
     end
     return
   end
-  if frameMs0 > M.HITCH_MS and st.inOurLevel then pcall(noteHitch, frameMs0) end
+  local hrec = nil
+  if frameMs0 > M.HITCH_MS and st.inOurLevel then
+    local okH, h = pcall(noteHitch, frameMs0)
+    if okH then hrec = h end
+  end
+  if st.inOurLevel and not st.paused then
+    local okP, errP = pcall(perfFrame, frameMs0, hrec)
+    if not okP then log('W', 'beamngEarth', 'perf log: ' .. tostring(errP)) end
+  end
   prevMarks, marks = marks, prevMarks
   for k in pairs(marks) do marks[k] = nil end
   local t = hitchClock()
@@ -1588,14 +1720,16 @@ local function onUpdate(dtReal, dtSim)
     if not fociBroken then
       local ok, err = pcall(collisionfoci.update, dtReal, { roads.setFoci, trees.setFoci }, farcars.foci)
       if not ok then fociBroken = true; log('E', 'beamngEarth', 'collision foci: ' .. tostring(err)) end
+      t = mark('foci', t)
       ok, err = pcall(terrainpatch.update, dtReal, st.anchorId, collisionfoci.last, st.player, pb, net.send)
       if not ok then fociBroken = true; log('E', 'beamngEarth', 'terrain patches: ' .. tostring(err)) end
       ok, err = pcall(farcars.update, dtReal)
       if not ok then fociBroken = true; log('E', 'beamngEarth', 'far cars: ' .. tostring(err)) end
+      t = mark('farcars', t)
     end
-    parking.update(st.anchorId, not (st.player and st.player.camera) and st.player or nil, pb)   -- (no car: none parked)
+    parking.update(st.anchorId, not (st.player and st.player.camera) and st.player or nil, pb, gov)  -- (no car: none parked)
     t = mark('parking', t)
-    navgraph.update(st.anchorId, pb)
+    navgraph.update(st.anchorId, pb, gov)
     t = mark('navgraph', t)
     updateSky(dtReal)
     updateGuard()
@@ -1791,6 +1925,8 @@ teleportTo = function(lat, lon, name, kind)
   end
   if requestAnchor(aLat, aLon, 'teleport', cx, cy, place) then
     setStatus(string.format('Preparing terrain at %.5f, %.5f ...', lat, lon))
+    loadprogress.reset()
+    loadprogress.start(st.clock)        -- the bar says "Loading" from now (loadprogress.lua)
     parking.onTeleport()
     navgraph.onTeleport()
     do local ok, err = pcall(farcars.onTeleport) if not ok then log('W', 'beamngEarth', 'far cars: ' .. tostring(err)) end end

@@ -5,6 +5,9 @@ was ~20 % of a road tile, 0.9 s of ~4 s); the compiled module does them in one c
 twins of the kernels are gone (the user, 2026-10-21: "we dont need 2 versions of the same thing"); require() says
 what is missing when it cannot be loaded.
 """
+import os
+import sys
+
 import numpy as np
 
 try:
@@ -13,7 +16,7 @@ except ImportError:         # no binary for this platform / Python: require() sa
     _ef = None
 
 AVAILABLE = _ef is not None
-MIN_VERSION = 60            # the newest kernel signature the server calls (earthd checks it at start)
+MIN_VERSION = 68            # the newest kernel signature the server calls (earthd checks it at start)
 
 
 class NativeMissing(RuntimeError):
@@ -86,6 +89,11 @@ def gpu():
     """The GPU's name when the kernels can run there (earthfast gpu.rs: Vulkan / DX12 / Metal), else None (none, an old
     module, or BNGE_GPU=0): the callers keep their CPU path. Found once (~0.4 s, the first call)."""
     global _GPU
+    if _GPU is None and sys.platform == "win32" and os.environ.get("BNGE_GPU") != "1":
+        # Windows: off unless BNGE_GPU=1 (2026-10-23). 1.6.0's players on Windows saw the game freeze for seconds in new
+        # places (none on Linux or a Steam Deck); a long compute dispatch from the server can hold the GPU the game draws
+        # with, and Windows often cannot preempt it. The CPU path is 1.5.5's.
+        _GPU = ""
     if _GPU is None:
         try:
             _GPU = _ef.gpu_name() or "" if getattr(_ef, "VERSION", 0) >= 58 else ""

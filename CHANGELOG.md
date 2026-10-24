@@ -2,6 +2,100 @@
 
 What changed in each release of BeamNG.Earth, newest first.
 
+## 1.6.1 beta (2026-10-23)
+
+Works with BeamNG.drive 0.40.3.
+
+### Smoother driving
+- **Reduced the chance of hitches on Windows when the ground moves with you.** Each time the ground under the car moved
+  to its next piece, Windows rebuilt the ground's textures a second time. In testing on a Steam Deck, that frame got
+  about 30 % shorter without it (a player's GTX 1060 showed 0.25-0.34 s frames there).
+- **Reduced the chance of freezes in new places on Windows.** The world server's graphics card work added in 1.6.0
+  (colour matching and texture compression) is off by default on Windows for now, as in 1.5.5, and the world server
+  keeps to its own CPU cores while the game has the others, as on Linux (from KyzoFox's PR #112).
+- **Reduced the chance of stutters while driving.** The traffic map, parked cars and collision updates no longer pile
+  into the same frame as the road and building loading. In testing on a Steam Deck in Baltimore, frames slower than
+  1/10 s went from 10-12 to 4 on the same 2.4-mile drive.
+- **Fewer stutters from the ground moving under you in town.** The drivable ground moves ahead in longer steps at
+  town speeds (about 4 times a mile instead of 8-12).
+- **New ground is ready sooner while driving.** The aerial photo under each new piece of ground, the slowest part of
+  building it, is made about 25 % faster on a Steam Deck and about twice as fast on a desktop, with the same result.
+- **Better at very high speed.** Above about 157 mph a new piece of ground no longer waits for its aerial photo; the
+  photo follows a moment later. In testing on a Steam Deck at 600 mph, the waits for the ground went from 11 a minute
+  (7.6 s) to 4 (1.2 s).
+
+### Faster loading
+- **Faster teleports to new places.** On a first visit the car is placed in about 4 seconds on a Steam Deck (it took
+  23-32 seconds); the roads are painted into the ground's photo a few seconds later.
+- **Less downloading and less CPU on a first visit.** The world server's helper processes no longer download the same
+  map data at the same time or work out the same roads' levelling. In testing, a first visit to Spokane downloaded
+  about 260 MB instead of 400 MB, and a teleport on a Steam Deck used about 35 % less CPU.
+- **Trees are placed about 9 times faster** (the same trees), and several other slow parts of the world server now run
+  as fast native code.
+- **Reduced the chance of very slow loading after many satellite photos in a day** (GitHub #116). In testing on a
+  Steam Deck the car was placed in 10-11 seconds instead of 37.
+- **Aerial photos in the US download faster:** more are fetched from the USGS at once.
+
+### Loading line and minimap
+- **A clearer loading line.** It shows the moment you teleport (F7 included), on its own line under the place name,
+  with each part and its progress: the ground, roads & buildings, trees and the distant land. It stays until
+  everything around you is in, including the ground's final photo with the roads painted in.
+- **The minimap shows your Earth coordinates** (latitude and longitude) above it, instead of the town.
+
+### Multiplayer (BeamMP)
+- **Reduced the chance of multiplayer freezing.** While the ground under you was still loading (after a teleport, or
+  BeamMP's teleport to a player), the mod paused the game, which in BeamMP froze every car on your screen, the other
+  players' too. Now only your own car waits.
+- **Reduced the chance of a freeze when players join.** Every join sent the full damage state of every nearby car to
+  everyone, undamaged ones too; now only damaged cars' state is sent.
+- **Another player's car you removed stays removed** (it came back at once with BeamMP's "Trying to respawn" notice).
+- **The server picks the sharing port.** The TCP port players reach each other on to share world building (47621)
+  is set at the top of the server plugin's `main.lua` (`G.SHARE_PORT`); every player who joins gets it.
+- **Shared world building stays consistent:** a helper building for another player builds the roads the same way that
+  player's game does (from hashk014's PR #187).
+
+### Fixes
+- **Reduced the chance of roads and water missing in new places.** 1.5.5 and 1.6.0 came with a newer version of a
+  library the world server reads map data with, and on a first visit some of its reads came out corrupted, so those
+  areas lost their road details or their water. This version goes back to the one 1.5.4 used.
+- **Reduced the chance of roads missing their lane counts and widths for good** when the OpenStreetMap road details
+  could not be fetched ahead of time; they are now fetched again when the area is needed.
+- **Reduced the chance of the autodrive getting stuck** (GitHub #180). On divided roads its next target could fall on
+  the other side of the highway, and the car tried to turn around and crawled at 4 mph. Targets now stay on the car's
+  own side, and a car that stops making progress plans its path again, then is put back on the road ahead.
+- **The download cache keeps to its size limit.** Several of its folders grew outside it, run after run (35 GB on a
+  test machine set to 20 GB); they are now trimmed when the world server starts, without stalling the ground's
+  building.
+- **The mod loads in a game that was already running.** When the BeamNG.Earth app starts while the game runs (started
+  by the BeamMP launcher, for example) and the mod was just installed, updated or turned back on, the app has the game
+  reload its Lua, so the mod loads without restarting the game; a level that was open is started again.
+
+### For bug reports
+- **A log that helps us find what's slow.** The world server's log (`server.log` in the `beamng-earth\logs` folder)
+  now also records your computer and graphics settings, every hitch and frame-rate drop in the game with where it
+  happened, how fast you were going and what was loading, and a summary every minute. If something stutters or
+  freezes, send us that file right after it happens.
+
+### Which file do I need?
+- **`BeamNG.Earth-1.6.1-beta.exe`: Windows players.** The whole app in one file: run it and it installs the mod into
+  BeamNG.drive, starts the world server and starts the game (Windows may warn about an unknown app: More info > Run
+  anyway). Steam must be running.
+- **`BeamNG.Earth-1.6.1-beta-x86_64.AppImage`: Linux and Steam Deck players** (on the Deck, in Desktop Mode). The same
+  app for Linux: make it executable (right-click > Properties, or `chmod +x`) and run it.
+- **Joining a BeamMP server with BeamNG.Earth?** You need the app above (the same version as the server's). The best
+  way: start the **BeamMP launcher first** and wait until the game has fully started, **then** start the BeamNG.Earth
+  app, then join a server running the BeamMP.Earth plugin (the [Discord](https://discord.gg/tgf) has the IPs).
+- **`BeamNG.Earth-BeamMP-Server-1.6.1-beta.zip`: only for people hosting a BeamMP server.** The drop-in server
+  package (unzip it into the BeamMP server's folder, see the README's Multiplayer section). Players joining a server
+  don't need it: they run the app above.
+- **`Source code (zip)` and `Source code (tar.gz)`: for developers.** Added by GitHub to every release: the project's
+  code as it was for this version, the same files in two archive formats (zip for Windows, tar.gz for Linux and
+  macOS). Only needed to read or change the code, or to run from source (`install.py`, then `start.py`); not needed to
+  play.
+
+If you want to talk about this mod with me or other people, join my Discord server at
+[discord.gg/tgf](https://discord.gg/tgf) and head to the #beamng-earth channel.
+
 ## 1.6.0 beta (2026-10-23)
 
 Works with BeamNG.drive 0.40.3.

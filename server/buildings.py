@@ -2843,67 +2843,78 @@ def photo_mask(frame, x0, y0, size, px, md):
         if f is None:
             continue
         hs = f.attrs.get("height")
-        for i in range(len(f.kind)):
-            fid = f.ids[i]
-            if fid in seen:
-                continue
-            seen.add(fid)
-            parts = f.parts(i)
-            if not parts or not parts[0]:
-                continue
-            ring = np.asarray(parts[0][0], np.float64)
-            e, nn = mapgeom.enu_xy(f, frame, ring)
-            if e.max() < x0 or e.min() > x0 + size or nn.max() < y0 or nn.min() > y0 + size:
-                continue
-            h = float(hs[i]) if hs is not None and np.isfinite(hs[i]) else 8.0
-            grow = (PHOTO_GROW_M + min(PHOTO_LEAN * h, PHOTO_LEAN_MAX_M)) / mpp
-            cx, cy = (e - x0) / mpp, (y0 + size - nn) / mpp
-            c = np.array([cx.mean(), cy.mean()])
-            pts = np.stack([cx, cy], 1)
-            d = pts - c
-            r = np.hypot(d[:, 0], d[:, 1])[:, None]
-            pts = pts + d / np.maximum(r, 1e-6) * grow          # grown out from its middle
-            draw.polygon([tuple(p) for p in pts], fill=255)
-            n += 1
+        ids = f.ids.tolist()
+        rows, a, b = _photo_candidates(f, frame, x0, y0, size)
+        keep = [j for j, i in enumerate(rows) if ids[i] not in seen]  # (a building in two cells: the first piece)
+        if not keep:
+            seen.update(ids)
+            continue
+        rows, a, b = rows[keep], a[keep], b[keep]
+        # every kept outer ring grown out from its middle, all at once
+        h = np.full(len(rows), 8.0) if hs is None else np.asarray(hs, np.float64)[rows]
+        h = np.where(np.isfinite(h), h, 8.0)
+        grow = (PHOTO_GROW_M + np.minimum(PHOTO_LEAN * h, PHOTO_LEAN_MAX_M)) / mpp
+        ln = b - a
+        idx = np.repeat(a - np.r_[0, np.cumsum(ln)[:-1]], ln) + np.arange(int(ln.sum()))
+        xy = f.xy_in(frame)[idx]
+        cx, cy = (xy[:, 0] - x0) / mpp, (y0 + size - xy[:, 1]) / mpp
+        starts = np.r_[0, np.cumsum(ln)[:-1]]
+        mx = np.repeat(np.add.reduceat(cx, starts) / ln, ln)
+        my = np.repeat(np.add.reduceat(cy, starts) / ln, ln)
+        dx, dy = cx - mx, cy - my
+        g = np.repeat(grow, ln) / np.maximum(np.hypot(dx, dy), 1e-6)
+        pts = np.stack([cx + dx * g, cy + dy * g], 1).tolist()
+        for s0, m in zip(starts.tolist(), ln.tolist()):
+            draw.polygon([tuple(q) for q in pts[s0:s0 + m]], fill=255)
+        n += len(rows)
+        seen.update(ids)
     if n == 0:
         return None
     return np.asarray(img) > 0
 
 
-def _push_pull(c, w):
-    """c (h, w, k) float with weights w (h, w) in [0, 1]: every pixel with w < 1 blended toward a smooth
-    fill from the weighted pyramid of the pixels around it (push-pull), however far away they are."""
-    from PIL import Image
-    h, wd = w.shape
-    if w.min() >= 1.0 or max(h, wd) <= 1 or w.max() <= 0.0:
-        return c
-    H, W = (h + 1) // 2, (wd + 1) // 2
-    pw = np.zeros((H * 2, W * 2), np.float32)
-    pc = np.zeros((H * 2, W * 2, c.shape[2]), np.float32)
-    pw[:h, :wd] = w
-    pc[:h, :wd] = c * w[:, :, None]
-    sw = pw.reshape(H, 2, W, 2).sum((1, 3))
-    sc = pc.reshape(H, 2, W, 2, -1).sum((1, 3))
-    coarse = _push_pull(sc / np.maximum(sw, 1e-6)[:, :, None], np.minimum(sw, 1.0))
-    up = np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(coarse[:, :, k]), "F")
-                              .resize((W * 2, H * 2), Image.BILINEAR), np.float32)[:h, :wd]
-                   for k in range(c.shape[2])], axis=2)
-    return c * w[:, :, None] + up * (1.0 - w[:, :, None])
+def _photo_candidates(f, frame, x0, y0, size):
+    """Rows of f (a cell's buildings) whose outer ring's box meets the square [x0, x0 + size]² and that come first
+    among the rows of their id, ascending, with their outer rings' coordinate ranges [a, b): photo_mask's buildings, its test made for all rows at once (one ring at a
+    time it was ~19k Python steps a block, most of a block photo's roof mask; 2026-10-23)."""
+    m = len(f.kind)
+    none = (np.zeros(0, np.int64),) * 3
+    if m == 0:
+        return none
+    p = f.part_off[:-1]
+    has = (f.part_off[1:] > p)
+    r = f.ring_off[np.minimum(p, len(f.ring_off) - 2)]
+    has &= f.ring_off[np.minimum(p, len(f.ring_off) - 2) + 1] > r
+    a = f.coord_off[np.minimum(r, len(f.coord_off) - 2)]
+    b = f.coord_off[np.minimum(r, len(f.coord_off) - 2) + 1]
+    has &= b > a
+    _, first = np.unique(f.ids, return_index=True)
+    head = np.zeros(m, bool)
+    head[first] = True
+    rows = np.flatnonzero(has & head)
+    if len(rows) == 0:
+        return none
+    xy = f.xy_in(frame)
+    a, b = a[rows], b[rows]
+    order = np.argsort(a, kind="stable")       # (reduceat: ascending starts)
+    e_lo = np.empty(len(rows)); e_hi = np.empty(len(rows)); n_lo = np.empty(len(rows)); n_hi = np.empty(len(rows))
+    e_lo[order] = mapgeom._reduce(np.minimum, xy[:, 0], a[order], b[order])
+    e_hi[order] = mapgeom._reduce(np.maximum, xy[:, 0], a[order], b[order])
+    n_lo[order] = mapgeom._reduce(np.minimum, xy[:, 1], a[order], b[order])
+    n_hi[order] = mapgeom._reduce(np.maximum, xy[:, 1], a[order], b[order])
+    inside = ~((e_hi < x0) | (e_lo > x0 + size) | (n_hi < y0) | (n_lo > y0 + size))
+    return rows[inside], a[inside], b[inside]
 
 
 def fill_photo(rgb, mask, size, px):
     """rgb (px, px, 3) uint8 with the masked pixels replaced by a smooth fill from the unmasked ground
     around them: a push-pull pyramid, so a footprint of any size fills (one PHOTO_FILL_M blur left black
-    holes in big blocks), softened by that blur."""
-    from PIL import Image, ImageFilter
-    if not (~mask).any():
-        return rgb
-    w = (~mask).astype(np.float32)
-    out = _push_pull(rgb.astype(np.float32), w)
+    holes in big blocks), softened by that blur (earthfast.fill_photo: the numpy / Pillow version's numbers,
+    a third of its time; 2026-10-23)."""
+    import fast
+    fast.require(68, "the ground photo's roof fill")
     r = max(2.0, PHOTO_FILL_M / (size / px))
-    soft = np.asarray(Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(r)), np.float32)
-    out = np.where(mask[:, :, None], soft, rgb.astype(np.float32))
-    return np.clip(out, 0, 255).astype(np.uint8)
+    return fast._ef.fill_photo(np.ascontiguousarray(rgb, np.uint8), np.ascontiguousarray(mask, bool), float(r))
 
 
 BRICK_WALK_COVERAGE = 0.35  # dense old cores (row houses) of brick regions ...

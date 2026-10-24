@@ -159,6 +159,71 @@ class DetailBaseRefreshTest(ServerHarness):
         self.assertFalse([m for m in c.drain(1.0) if m["type"] == "block_base"], "once")
 
 
+class DetailQuickPhotoTest(ServerHarness):
+    """A teleport's provisional photo (write_base quick) does not wait for a fresh place's buildings and roads: it goes
+    without the roofs' mask while they are not on disk, and is rendered again in full later (base_stale)."""
+    near_visual = "detail"
+    with_imagery = True
+    cells = 64
+    block = 512
+
+    def test_quick_skips_missing_map_data(self):
+        self.hello()
+        aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
+        s = self.server
+        anchor = s.anchors[aid]
+        asked = []
+
+        class MD:
+            cached = False
+
+            def has(self, key, layer):
+                return self.cached
+
+            def cell(self, key, layers=None, kind=None):
+                asked.append(layers)
+                raise OSError("not here")
+        s.mapdata, s.buildings = MD(), True
+        s.base_stale.discard((aid, 0.0, 0.0))
+        self.assertIsNotNone(s.write_base(anchor, 0.0, 0.0, quick=True))
+        self.assertEqual(asked, [], "no map data asked for")
+        self.assertIn((aid, 0.0, 0.0), s.base_stale, "rendered again in full later")
+        s.mapdata.cached = True                 # a place seen before: the full photo at once
+        s.write_base(anchor, 0.0, 0.0, quick=True)
+        self.assertEqual(asked, [("buildings",)] * len(asked))
+        self.assertTrue(asked)
+
+
+class DetailFastPhotoLaterTest(ServerHarness):
+    """A fast player (earthd FAST_BASE_V): a block whose photo is slow goes without it, the photo follows (block_base)
+    and later answers for the block carry it."""
+    near_visual = "detail"
+    with_imagery = True
+    cells = 64
+    block = 512
+
+    def test_photo_follows_the_block(self):
+        self.hello()
+        aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
+        s = self.server
+        orig = s.write_base
+
+        def slow(*a, **kw):
+            time.sleep(1.0)
+            return orig(*a, **kw)
+        s.write_base = slow
+        s.fast = True
+        t0 = time.monotonic()
+        self.c.send({"type": "prepare_terrain", "requestId": 3, "anchorId": aid, "cx": 512.0, "cy": 0.0})
+        tr, _ = self.c.until(lambda m: m["type"] == "terrain_ready", timeout=60)
+        self.assertNotIn("base", tr, "sent without its photo")
+        self.assertLess(time.monotonic() - t0, 0.95, "not held for the photo")
+        m, _ = self.c.until(lambda m: m["type"] == "block_base", timeout=30)
+        self.assertEqual((m["anchorId"], m["cx"], m["cy"]), (aid, 512.0, 0.0))
+        self.assertTrue(os.path.exists(self.fs(m["base"])))
+        self.assertEqual(s.hm[(aid, 512.0, 0.0)]["base"], os.path.basename(m["base"]))
+
+
 class DetailNoImageryTest(ServerHarness):
     near_visual = "detail"
     with_imagery = False

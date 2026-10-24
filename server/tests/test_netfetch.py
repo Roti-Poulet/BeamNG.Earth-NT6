@@ -111,16 +111,30 @@ def fetcher(script=None, policies=None, **kw):
 
 class TokenBucketTest(unittest.TestCase):
     def test_burst_then_rate(self):
-        """N demand requests at t=0: `burst` go at once, the rest 1/rate apart."""
+        """N demand requests at t=0: `burst` less URGENT_TOKENS go at once, the rest 1/rate apart (the bucket keeps
+        URGENT_TOKENS for urgent requests)."""
         f, clock, sleep, tr = fetcher()
         p = nf.POLICIES[USGS]
-        n = int(p.burst) + 10
+        b = int(p.burst - nf.URGENT_TOKENS)
+        n = b + 10
         for i in range(n):
             f.get(url(USGS, i))
         t = [c[0] - T0 for c in tr.calls]
-        self.assertEqual(t[:int(p.burst)], [0.0] * int(p.burst))
-        for k, ti in enumerate(t[int(p.burst):], 1):
+        self.assertEqual(t[:b], [0.0] * b)
+        for k, ti in enumerate(t[b:], 1):
             self.assertAlmostEqual(ti, k / p.rate, places=4)
+
+    def test_urgent_goes_first(self):
+        """With demand holding the bucket at its floor, an urgent request still gets a token at once (GitHub
+        #116: the player's block behind the far field's requests)."""
+        f, clock, sleep, tr = fetcher()
+        p = nf.POLICIES[USGS]
+        for i in range(int(p.burst - nf.URGENT_TOKENS)):
+            f.get(url(USGS, i))
+        t0 = clock()
+        f.get(url(USGS, 999), kind="urgent")
+        self.assertEqual(tr.calls[-1][0], t0, "the urgent request did not wait")
+        self.assertTrue(f.allow(USGS, "urgent"))
 
     def test_prefetch_only_above_half(self):
         f, clock, sleep, tr = fetcher()
@@ -208,7 +222,7 @@ class ColdStartTest(unittest.TestCase):
                       f"first minute, then {p.rate:g}/s", file=sys.stderr)
                 self.assertLessEqual(peak1, p.burst + p.rate + 1)
                 self.assertLessEqual(first_min, p.burst + 60 * p.rate + 1)
-                self.assertAlmostEqual(t[-1], max(0.0, (n - p.burst) / p.rate), delta=1e-3)
+                self.assertAlmostEqual(t[-1], max(0.0, (n - p.burst + nf.URGENT_TOKENS) / p.rate), delta=1e-3)
 
     def test_a_pool_cannot_outrun_the_bucket(self):
         """8 threads (the DEM pool) with zero latency, real clock: the bucket still sets the pace."""
@@ -627,9 +641,9 @@ class PolicyTest(unittest.TestCase):
         self.assertLessEqual(nf.DEFAULT_POLICY.rate, 2.0)
 
     def test_policies_match_the_plan(self):
-        """docs/research/2026-10-10-rate-limits.md §5.2 for the hosts in use, raised 2026-10-16
+        """docs/research/2026-10-10-rate-limits.md §5.2 for the hosts in use, raised 2026-10-16 (USGS again 2026-10-23)
         (docs/research/2026-10-16-rate-limits-raised.md)."""
-        want = {USGS: (50, 150, 12, 150000), EOX: (10, 40, 6, 30000), MT: (50, 200, 32, 80000),
+        want = {USGS: (50, 150, 24, 150000), EOX: (10, 40, 6, 30000), MT: (50, 200, 32, 80000),
                 "s3.amazonaws.com": (50, 100, 8, None), "api.open-meteo.com": (0.1, 2, 1, 500),
                 "downloads.sourceforge.net": (1, 1, 1, None)}
         for h, (rate, burst, conc, soft) in want.items():

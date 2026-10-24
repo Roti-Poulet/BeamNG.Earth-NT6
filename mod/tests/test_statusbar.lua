@@ -12,6 +12,10 @@ T.check(sb.compose({ place = 'Monaco', region = 'Monaco', country = 'Monaco' }) 
 T.check(sb.loadingLine('Far field loading: 150/433 tiles') == 'Loading 150/433', 'far field loading')
 T.check(sb.loadingLine('Preparing terrain at 39.1, -76.2 ...') == 'Building terrain', 'a teleport')
 T.check(sb.loadingLine('Far field ready (433 tiles)') == nil, 'ready: no loading part')
+-- the loading line is its own row (the user, 2026-10-23): the location row never carries it
+T.check(sb.loading('Anchor #3', 'Loading 40%  |  trees 2/9') == 'Loading 40%  |  trees 2/9', 'the loading row: the line given')
+T.check(sb.loading('Anchor #3', false) == '', 'no load: no loading row')
+T.check(not sb.text('Far field loading: 150/433 tiles', 'Loading 40%'):find('Loading', 1, true), 'the location row without it')
 
 -- requests: at once, then not before WHERE_MIN_S and WHERE_STREET_M; the place when online and far / late enough
 local p = { x = 0, y = 0, lat = 39.28, lon = -76.59 }

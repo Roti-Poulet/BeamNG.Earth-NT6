@@ -34,11 +34,13 @@ from collections import OrderedDict
 
 import netfetch
 import staging
+import xproc
 
 log = logging.getLogger("earthd.mapdata")
 
 BLOCK = 256 * 1024          # bytes per cached block
 MAX_RUN = 64                # blocks per Range request (16 MiB)
+BLOCK_WAIT_S = 60.0         # a block another process is fetching is waited for this long (xproc.once)
 MEM_BYTES = 64 * 1024 * 1024    # in-memory block LRU shared by every RemoteFile of the process
 CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
 # Errors after which the next mirror is asked (the same bytes from another host); NotFound is not
@@ -122,6 +124,9 @@ class RemoteFile:
     # --- blocks ----------------------------------------------------------------------------------
     def _path(self, i):
         return os.path.join(self.cache_dir, f"{i}.blk")
+
+    def _lock_path(self, i):
+        return os.path.join(self.cache_dir, f"{i}.blk.lock")
 
     def _saved_size(self):
         try:
@@ -265,13 +270,31 @@ class RemoteFile:
                     out[i] = b
                 else:
                     need.append(i)
-            run = []
-            for i in need + [None]:
-                if run and (i is None or i != run[-1] + 1 or len(run) >= MAX_RUN):
-                    out.update(self._fetch_run(run[0], run[-1] + 1, kind))
-                    run = []
-                if i is not None:
-                    run.append(i)
+            # the blocks another of the server's processes is fetching are waited for (xproc): every process starts
+            # on a new place at once and reads the same footers and row groups
+            held = [i for i in need if xproc.take(self._lock_path(i), kind)]
+            later = sorted(set(need) - set(held))
+            try:
+                run = []
+                for i in held + [None]:
+                    if run and (i is None or i != run[-1] + 1 or len(run) >= MAX_RUN):
+                        out.update(self._fetch_run(run[0], run[-1] + 1, kind))
+                        run = []
+                    if i is not None:
+                        run.append(i)
+            finally:
+                for i in held:
+                    xproc.release(self._lock_path(i))
+            for i in later:
+                b, lk = xproc.once(self._lock_path(i), lambda i=i: self._block_from_cache(i), BLOCK_WAIT_S, kind)
+                if b is None:
+                    try:
+                        b = self._fetch_run(i, i + 1, kind).get(i)
+                    finally:
+                        if lk:
+                            xproc.release(self._lock_path(i))
+                if b is not None:
+                    out[i] = b
         finally:
             with self._lock:
                 for i in mine:
@@ -294,7 +317,12 @@ class RemoteFile:
         i0, i1 = start // self.block, (end - 1) // self.block + 1
         got = self.blocks(i0, i1, kind)
         buf = b"".join(got[i] for i in range(i0, i1) if i in got)
-        return buf[start - i0 * self.block:end - i0 * self.block]
+        out = buf[start - i0 * self.block:end - i0 * self.block]
+        # (a block left out mid-range would shift every byte after it: a corrupt page for DuckDB, not an error)
+        if len(out) != end - start and (self.size is not None or i1 - 1 in got):
+            log.warning("rangeread: short read of %s [%d, %d): %d bytes, blocks %s of %d..%d, size %s",
+                        self.cache_dir, start, end, len(out), sorted(got), i0, i1 - 1, self.size)
+        return out
 
 
 # --- fsspec filesystem for DuckDB ----------------------------------------------------------------

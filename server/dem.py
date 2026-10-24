@@ -53,6 +53,7 @@ URGENT_WORKERS = 16         # Dem.urgent(): its own fetch threads (with the 16 s
 # older than MIRROR_MAX_AGE_S it is made again (Mapterhorn adds lidar areas). DECODED_VERSION: raise it when what a
 # tile holds changes (the decoding, the ground filter).
 MIRROR_MB = 1024
+MIRROR_PRUNE_S = 120.0  # the mirror pruned at most this often per process (each prune walks it all)
 MIRROR_MAX_AGE_S = 30 * 86400
 DECODED_VERSION = 2          # 2: tiles past the lidar's depth upsampled from its deepest tile, not z12; its holes
                              # filled (fill_holes)
@@ -117,31 +118,8 @@ def fill_holes(a, k=HOLE_FILL_MAX_PX):
     Spangen on land, 2026-10-21): a polder at -1.5 m got 0 m pits, and seacarve read them as the sea. Zeros take
     the mean of their non-zero 4-neighbours, k rounds; zero areas wider than that (the sea, which reads exactly
     0) keep 0, the band filled into their edge too. Pure."""
-    a = np.asarray(a, np.float32)
-    hole = a == 0
-    if not hole.any() or hole.all():
-        return a
-    out = a.copy()
-    todo = hole.copy()
-    for _ in range(k):
-        if not todo.any():
-            break
-        p = np.pad(out, 1, mode="edge")
-        v = np.pad(~todo, 1, mode="edge").astype(np.float32)
-        s = (p[:-2, 1:-1] * v[:-2, 1:-1] + p[2:, 1:-1] * v[2:, 1:-1] + p[1:-1, :-2] * v[1:-1, :-2]
-             + p[1:-1, 2:] * v[1:-1, 2:])
-        n = v[:-2, 1:-1] + v[2:, 1:-1] + v[1:-1, :-2] + v[1:-1, 2:]
-        got = todo & (n > 0)
-        out[got] = s[got] / n[got]
-        todo &= ~got
-    if todo.any():
-        # what is left is a wide zero area: it and the rim filled into it stay 0
-        wide = todo.copy()
-        for _ in range(k):
-            p = np.pad(wide, 1)
-            wide = wide | ((p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:]) & hole)
-        out[wide] = 0.0
-    return out
+    fast.require(65, "dem.fill_holes")     # (earthfast fill_holes, 2026-10-23: the same values as the numpy rounds)
+    return fast._ef.fill_holes(np.ascontiguousarray(a, np.float32), int(k))
 
 
 def _resize(a, size):
@@ -371,14 +349,21 @@ class Dem:
             return None
         with Dem._mirror_lock:
             Dem._mirror_written += TILE * TILE * 4
-            prune = Dem._mirror_written >= MIRROR_MB * 1e6 / 8
+            # (and at most every MIRROR_PRUNE_S: each prune walks the whole mirror, ~28k folders; a fresh place's
+            # DEM reads in a worker triggered it again and again, seconds of a far field's geometry, 2026-10-23)
+            now = time.monotonic()
+            prune = (Dem._mirror_written >= MIRROR_MB * 1e6 / 8
+                     and now - Dem._mirror_pruned >= MIRROR_PRUNE_S)
             if prune:
-                Dem._mirror_written = 0
-        if prune:
-            self._mirror_prune()
+                Dem._mirror_written, Dem._mirror_pruned = 0, now
+        if prune:       # (beside the read that wrote it: the walk is seconds on a Steam Deck)
+            threading.Thread(target=self._mirror_prune, daemon=True, name="dem-mirror-prune").start()
         return self._mirror_get(key)
 
-    _mirror_written = 0
+    # (a process's first write prunes: the count of a session's own writes alone never reached the threshold when
+    # each run wrote less, and the mirror grew past MIRROR_MB across sessions: 6.3 GB on a Steam Deck, 2026-10-23)
+    _mirror_written = MIRROR_MB * 1e6
+    _mirror_pruned = -1e9
     _mirror_lock = threading.Lock()
 
     def _mirror_prune(self):

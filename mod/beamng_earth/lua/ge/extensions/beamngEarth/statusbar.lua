@@ -14,6 +14,7 @@ M.enabled = true
 M.TOP = 6                  -- px from the top of the viewport
 M.PAD_X, M.PAD_Y = 10, 4
 M.SEP = '  |  '
+M.ROW_GAP = 3              -- px between the location row and the loading row
 M.TEXT_RGBA = { 1, 1, 1, 0.92 }
 M.BACK_RGBA = { 0.05, 0.06, 0.08, 0.55 }
 M.WHERE_STREET_M = 30
@@ -27,7 +28,7 @@ local last = nil           -- { x, y, t, px, py, pt } of the last request (stree
 local nextId = 0
 local fps = nil
 M.SHOW_FPS = false     -- (the user, 2026-10-15: Steam has an fps overlay, we do not need our own counter)
-local layout, textU32, backU32, vecs = nil, nil, nil, nil
+local textU32, backU32, vecs = nil, nil, nil
 M.draws, M.measures, M.requests = 0, 0, 0
 
 -- Pure: the bar's text from the location, the loading line (nil when loaded) and the fps (nil: unknown).
@@ -108,46 +109,65 @@ end
 
 local function u32(im, c) return im.GetColorU322(im.ImVec4(c[1], c[2], c[3], c[4])) end
 
-local function drawImgui(im, text)
-  local vp = im.GetMainViewport()
-  if not vp then return false end
-  local vw = vp.Size.x
-  local fsz = im.GetFontSize()
-  local L = layout
+local layouts = {}       -- row -> { text, vw, fsz, w, h }: measured only when its text or the viewport changed
+
+-- One centred row (its own background) at y; returns the y under it.
+local function drawRow(im, dl, vp, row, text, y)
+  local vw, fsz = vp.Size.x, im.GetFontSize()
+  local L = layouts[row]
   if not L or L.text ~= text or L.vw ~= vw or L.fsz ~= fsz then
     local ts = im.CalcTextSize(text)
     L = { text = text, vw = vw, fsz = fsz, w = ts.x, h = ts.y }
-    layout = L
+    layouts[row] = L
     M.measures = M.measures + 1
   end
-  if not textU32 then textU32, backU32 = u32(im, M.TEXT_RGBA), u32(im, M.BACK_RGBA) end
-  if not vecs then vecs = { im.ImVec2(0, 0), im.ImVec2(0, 0), im.ImVec2(0, 0) } end
   local x = vp.Pos.x + (vw - L.w) / 2
-  local y = vp.Pos.y + M.TOP + M.PAD_Y
   local p, a, b = vecs[1], vecs[2], vecs[3]
   p.x, p.y = x, y
   a.x, a.y = x - M.PAD_X, y - M.PAD_Y
   b.x, b.y = x + L.w + M.PAD_X, y + L.h + M.PAD_Y
-  local dl = im.GetBackgroundDrawList1()
   im.ImDrawList_AddRectFilled(dl, a, b, backU32, 4)
   im.ImDrawList_AddText1(dl, p, textU32, text, nil)
+  return y + L.h + 2 * M.PAD_Y + M.ROW_GAP
+end
+
+local function drawImgui(im, text, loading)
+  local vp = im.GetMainViewport()
+  if not vp then return false end
+  if not textU32 then textU32, backU32 = u32(im, M.TEXT_RGBA), u32(im, M.BACK_RGBA) end
+  if not vecs then vecs = { im.ImVec2(0, 0), im.ImVec2(0, 0), im.ImVec2(0, 0) } end
+  local dl = im.GetBackgroundDrawList1()
+  local y = vp.Pos.y + M.TOP + M.PAD_Y
+  if text ~= '' then y = drawRow(im, dl, vp, 1, text, y) end
+  if loading ~= '' then drawRow(im, dl, vp, 2, loading, y) end
   return true
 end
 
--- The bar's text now (the UI app's too: hudapps.lua), '' when there is nothing to say.
-function M.text(status)
-  return M.compose(loc, M.loadingLine(status), M.SHOW_FPS and fps or nil)
+-- The loading part: line (the mod's loadprogress.lua: a string, or false for none) when given, else from status.
+local function loadingPart(status, line)
+  if line == nil then return M.loadingLine(status) end
+  return line or nil
+end
+
+-- The bar's location line now (the UI app's too: hudapps.lua), '' when there is nothing to say.
+function M.text(status, line)
+  return M.compose(loc, nil, M.SHOW_FPS and fps or nil)
+end
+
+-- The loading line under it (the user, 2026-10-23: "make loading on a separate line"), '' when none.
+function M.loading(status, line)
+  return loadingPart(status, line) or ''
 end
 
 -- Once per frame: draw the bar. active: our world is shown; hidden: the game's UI covers it; status: core's status
--- text. An error in the imgui calls turns the bar off (logged once).
-function M.draw(active, hidden, status)
+-- text; line: the loading part (loadprogress.lua), see M.text. An error in the imgui calls turns the bar off (logged once).
+function M.draw(active, hidden, status, line)
   if not M.enabled or not active or hidden then return false end
-  local text = M.compose(loc, M.loadingLine(status), M.SHOW_FPS and fps or nil)
-  if text == '' then return false end
+  local text, loading = M.text(status, line), M.loading(status, line)
+  if text == '' and loading == '' then return false end
   local im = rawget(_G, 'ui_imgui')
   if not im or not im.GetMainViewport then return false end
-  local ok, drawn = pcall(drawImgui, im, text)
+  local ok, drawn = pcall(drawImgui, im, text, loading)
   if not ok then
     M.enabled, M.failed = false, tostring(drawn)
     if log then log('E', 'beamngEarth.statusbar', 'status bar turned off: ' .. M.failed) end

@@ -123,14 +123,10 @@ end
 
 -- One frame with the engine: veh (the player's vehicle), box (the collidable area), clock (s).
 -- Returns the mode. Far inside the block nothing is called at all.
-local function simPaused()
-  local sta = rawget(_G, 'simTimeAuthority')
-  return sta and sta.getPause and sta.getPause() or false
-end
-local function simPause(on)
-  local sta = rawget(_G, 'simTimeAuthority')
-  if sta and sta.pause then sta.pause(on) end
-end
+-- (in a BeamMP session: our own car held, not every car on the screen: simhold.lua)
+local simhold = require('beamngEarth/simhold')
+local function simPaused() return simhold.paused() end
+local function simPause(on) simhold.pause(on) end
 
 -- A guard pause ends: the block followed (the car RESUME_INSIDE_M past the stop line), or the guard is turned off
 -- (the server healthy again: core.lua calls this then).

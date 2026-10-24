@@ -21,6 +21,23 @@ local segs = G.edgeSegments(gnodes)
 T.check(#segs == 1, 'one edge, once')
 local ed, ez = G.nearestEdge(segs, 100, 10)
 T.check(math.abs(ed - 10) < 1e-9 and ez == 2, 'a point beside the middle of an edge: on the graph')
+-- a divided road: two one-way carriageways 20 m apart; with the route's heading only the one running its way counts
+local div = { n1 = { pos = { x = 0, y = 0, z = 0 }, links = { n2 = { oneWay = true, inNode = 'n1' } } },
+              n2 = { pos = { x = 0, y = 300, z = 0 }, links = {} },
+              s1 = { pos = { x = 20, y = 400, z = 5 }, links = { s2 = { oneWay = true, inNode = 's1' } } },
+              s2 = { pos = { x = 20, y = 0, z = 5 }, links = {} } }
+local dsegs = G.edgeSegments(div)
+local dn = G.nearestEdge(dsegs, 10, 350)
+T.check(math.abs(dn - 10) < 1e-9, 'without a heading: past the northbound end, the southbound carriageway 10 m away')
+dn = G.nearestEdge(dsegs, 10, 350, 0, 1)
+T.check(math.abs(dn - math.sqrt(100 + 50 * 50)) < 1e-9, 'heading north: only the northbound carriageway (its end 51 m off)')
+dn = G.nearestEdge(dsegs, 10, 100, 0, -1)
+T.check(math.abs(dn - 10) < 1e-9, 'heading south: the southbound one')
+local _, _, bp = G.nearestEdge(dsegs, 10, 100, 0, -1)
+T.check(bp and math.abs(bp.x - 20) < 1e-9 and math.abs(bp.y - 100) < 1e-9 and bp.dy < 0 and math.abs(bp.dx) < 1e-9,
+  'the point on the southbound carriageway, facing the way it is driven')
+_, _, bp = G.nearestEdge(dsegs, 10, 100, 0, 1)
+T.check(bp and math.abs(bp.x) < 1e-9 and bp.dy > 0, 'and on the northbound one, facing north')
 local e = { x = { 0, 100, 100 }, y = { 0, 0, 100 }, cum = { 0, 100, 200 } }
 local sl = G.routeSlice(e, 50, 160, 25)
 T.check(#sl == 6 and sl[1][1] == 50 and sl[3][1] == 100 and sl[3][2] == 0 and sl[6][1] == 100 and sl[6][2] == 60,

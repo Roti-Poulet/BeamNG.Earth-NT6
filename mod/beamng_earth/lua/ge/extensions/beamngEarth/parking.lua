@@ -11,6 +11,7 @@
 -- A new anchor clears them all (another frame); after a teleport the cars are scattered onto the new spots
 -- once there are enough near the player (a rebase moves every vehicle with the world: nothing to do).
 local M = {}
+local stopwatch = require('beamngEarth/stopwatch')
 
 M.REBUILD_S = 2.0
 M.KEEP_M = 900          -- spots this close to the player are in the sites
@@ -202,7 +203,12 @@ local function guard(player)
 end
 
 -- blk: the block's ground box {x0, y0, x1, y1} (nil: no limit).
-function M.update(aid, player, blk)
+-- A rebuild waits for a light frame (governor roomFor, as navgraph's applies), REBUILD_WAIT_FRAMES at most
+M.REBUILD_ROOM_MS = 4.0
+M.REBUILD_WAIT_FRAMES = 30
+local waited = 0
+
+function M.update(aid, player, blk, gov)
   if aid ~= anchorId then
     anchorId = aid
     objs = {}
@@ -221,8 +227,15 @@ function M.update(aid, player, blk)
   if not M.enabled or not player or not dirty or not next(spots) then return end
   local t = os.clock()
   if t - lastBuild < M.REBUILD_S then return end
+  if gov and gov.roomFor and waited < M.REBUILD_WAIT_FRAMES and not gov:roomFor(M.REBUILD_ROOM_MS) then
+    waited = waited + 1
+    return
+  end
+  waited = 0
   lastBuild, dirty = t, false
+  local sw = stopwatch.new()
   local ok, near = pcall(rebuild, player)
+  if gov and gov.noteFrame then gov:noteFrame(sw()) end
   if not ok then
     log('W', 'beamngEarth', 'parking: ' .. tostring(near))
     return

@@ -477,14 +477,16 @@ def clip_polygon_parts(parts, bounds):
 
 def _reduce(ufunc, v, a, b):
     """ufunc.reduce of v[a[k]:b[k]] for each k (every range non-empty, ascending, not overlapping)."""
-    out = ufunc.reduceat(v, a)
-    # reduceat runs each range to the next start: a range that ends before it (a gap) is cut at its own end
-    gap = np.flatnonzero(b[:-1] < a[1:])
-    for k in gap:
-        out[k] = ufunc.reduce(v[a[k]:b[k]])
-    if len(b) and b[-1] < len(v):
-        out[-1] = ufunc.reduce(v[a[-1]:b[-1]])
-    return out
+    if len(a) == 0:
+        return v[:0].copy()
+    # reduceat runs each range to the next start: with gaps between the ranges (outer rings only, a subset of the
+    # features), the ranges are gathered end to end first (one reduce per gap was ~12k numpy calls a block photo)
+    if (len(b) > 1 and (b[:-1] < a[1:]).any()) or b[-1] < len(v):
+        n = b - a
+        starts = np.r_[0, np.cumsum(n)[:-1]]
+        idx = np.repeat(a - starts, n) + np.arange(int(n.sum()))
+        return ufunc.reduceat(v[idx], starts)
+    return ufunc.reduceat(v, a)
 
 
 def enu_xy(feats, frame, ring):

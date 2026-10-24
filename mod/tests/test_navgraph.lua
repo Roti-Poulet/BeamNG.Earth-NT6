@@ -24,6 +24,20 @@ T.check(not N.headingToCut(60, 0, -1, 0, cuts, 60), '... heading away from it: n
 T.check(not N.headingToCut(60, 0, 0, 1, cuts, 60), '... across: not')
 T.check(not N.headingToCut(-20, 0, 1, 0, cuts, 60), '... 120 m from it: not yet')
 T.check(N.headingToCut(-20, 0, 1, 0, cuts, 30 * N.CUT_S), '... at 67 mph: from 120 m')
+-- built over several frames (navgraph's buildNodes: a coroutine pausing every yieldEvery items): the same tables
+do
+  local co = coroutine.create(function() return { N.toNodes(g, { -500, -500, 500, 500 }, 60, false, 2) } end)
+  local pauses, res = 0, nil
+  while true do
+    local ok, r = coroutine.resume(co)
+    T.check(ok, 'resumes cleanly')
+    if coroutine.status(co) == 'dead' then res = r break end
+    pauses = pauses + 1
+  end
+  T.check(pauses >= 3, 'it paused along the way: ' .. pauses)
+  T.check(res[2] == nn and res[3] == ne and #res[4] == #cuts and res[1].a.links.b.speedLimit == 11.2
+    and not res[1].far, 'the same nodes, edges and cuts as in one go')
+end
 local ab = nodes.a.links.b
 T.check(ab and nodes.b.links.a == ab, 'one edge table shared by both ends (double-sided)')
 T.check(ab.inNode == 'a' and ab.outNode == 'b' and ab.inPos == nodes.a.pos and ab.outPos == nodes.b.pos, 'in / out nodes and positions')

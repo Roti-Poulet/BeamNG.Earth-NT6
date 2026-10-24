@@ -25,10 +25,16 @@ class Raster:
 
 
 class Feats:
+    """mapgeom.Features' fields the vegetation reads: one part of one ring per feature."""
+
     def __init__(self, kind, rows, cls=None):
         self.kind = np.full(len(rows), kind, np.uint8)
         self.rows = rows
         self.attrs = {"class": np.array(cls or [""] * len(rows), object)}
+        self.lonlat = np.concatenate([np.asarray(r, np.float64) for r in rows]) if rows else np.zeros((0, 2))
+        self.coord_off = np.cumsum([0] + [len(r) for r in rows]).astype(np.int64)
+        self.ring_off = np.arange(len(rows) + 1, dtype=np.int64)
+        self.part_off = np.arange(len(rows) + 1, dtype=np.int64)
 
     def parts(self, i):
         return [[np.asarray(self.rows[i], np.float64)]]

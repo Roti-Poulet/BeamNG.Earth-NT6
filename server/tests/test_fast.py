@@ -5,6 +5,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +103,18 @@ class FastTest(unittest.TestCase):
         self.assertEqual(list(fast._ef.points_inside(sq, pts)), [True, False, False, True])
         d = fast._ef.polyline_dist(np.array([[0, 0], [10, 0]], float), np.array([[5, 3], [12, 0], [-3, 4]], float))
         self.assertTrue(np.allclose(d, [3, 2, 5]))
+
+
+
+
+class GpuDefaultTest(unittest.TestCase):
+    def test_windows_off_unless_asked(self):
+        # Windows players saw the game freeze in new places with 1.6.0's GPU kernels: the CPU path unless BNGE_GPU=1
+        import fast
+        with mock.patch.object(fast.sys, "platform", "win32"), mock.patch.object(fast, "_GPU", None), \
+                mock.patch.dict(fast.os.environ, {}, clear=False):
+            fast.os.environ.pop("BNGE_GPU", None)
+            self.assertIsNone(fast.gpu())
 
 
 if __name__ == "__main__":

@@ -14,3 +14,11 @@ Fetch threads to match: imagery.FETCH_WORKERS 6 -> 12, dem.Dem: 16 shared + 16 u
 Why: a first visit's far field (~500 tiles, ~1500 USGS requests) waited ~100-140 s on 15/s (Crater Lake, Mount
 Hood). Watch for 429 / 503 / throttling redirects (netfetch's breakers log them) and lower a host again if it
 pushes back.
+
+## 2026-10-23: USGS raised again (the user: "sure raise the limit")
+
+basemap.nationalmap.gov max_conc 12 -> 24, imagery FETCH_WORKERS 12 -> 16. Measured first (fresh caches, detail
+mode, Helena MT, PC): 12 at once gave 26.2-27.1 requests/s and the far field in 68.3-68.8 s; 24 gave 24.7/s and 67.8 s;
+every request answered 200. A Steam Deck's first visit (Richland WA, BNGE_NETLOG) made only 456 USGS requests at ~4/s:
+its far field is paced by its CPU (the elevation fetches come in bursts as the workers reach them), not by USGS. The
+higher cap is for players far from USGS, whose every request waits longer.

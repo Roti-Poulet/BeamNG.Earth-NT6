@@ -1236,17 +1236,10 @@ def _no_sag(s, z):
 
 def _dedupe(xy, tol=0.5):
     """A polyline without points closer than tol m to the previous one (ends kept). Pure."""
-    if len(xy) < 3:
-        return xy
-    keep = [0]
-    for k in range(1, len(xy) - 1):
-        if np.hypot(*(xy[k] - xy[keep[-1]])) >= tol:
-            keep.append(k)
-    if np.hypot(*(xy[-1] - xy[keep[-1]])) < tol and len(keep) > 1:
-        keep[-1] = len(xy) - 1
-    else:
-        keep.append(len(xy) - 1)
-    return xy[keep]
+    import fast
+    fast.require(66, "dedupe_polyline")     # (the Rust loop: 14-21 CPU-s a Deck teleport in each road process)
+    xy = np.asarray(xy, np.float64)
+    return xy[fast._ef.dedupe_polyline(xy, float(tol))]
 
 
 def _ground_envelope(s, g, grade, curve=0.0):
@@ -3846,6 +3839,13 @@ class Tracker:
         if self.pool is not None:
             self.pool.shutdown(wait=False, cancel_futures=True)
 
+    def progress(self):
+        """(done, wanted) of the road tiles round the car at the last pose: done = sent to the mod, empty, or failed
+        and waiting for its retry (nothing more comes for it now). (0, 0) before a pose."""
+        car = getattr(self, "car", ())
+        done = sum(1 for k in car if k in self.sent or k in self.empty or k in self.retry)
+        return done, len(car)
+
     def on_pose(self, conn, aid, x, y, loop, build, vel=(0.0, 0.0), ground_busy=False, view=None, foci=()):
         """Called with the player's position (and velocity, m/s) in the active anchor's frame. build(aid, tx, ty) runs
         in a worker and returns the tile's (path, n) or None; its result is announced with conn.send. ground_busy: a
@@ -3865,6 +3865,7 @@ class Tracker:
         vx, vy = (float(vel[0]), float(vel[1])) if vel else (0.0, 0.0)
         fast = math.hypot(vx, vy) >= FAST_MS
         car = wanted_tiles(x, y, vx, vy)
+        self.car = car                      # (progress: the loading line's road tiles)
         seen = set(tiles_near(*view, SEND_M)) - car if view else set()
         others = set()
         for f in foci:

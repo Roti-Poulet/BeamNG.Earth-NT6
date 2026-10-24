@@ -216,4 +216,20 @@ do
   T.check(g.tokens >= -governor.ENGINE_MAX_DEBT_MS, "the debt is capped")
   T.check(g:chargeEngine(1.5) == 0, 'a normal tick is free')
 end
+-- roomFor / noteFrame: the mod's occasional ops wait for a light frame, other work counted in it but not charged
+do
+  local t = 0
+  local g = governor.new({ clock = function() return t end })
+  g:try('cdae')
+  for _ = 1, 50 do t = t + 16; g:beginFrame(true) end
+  T.check(g:roomFor(4), 'a frame with nothing spent: room')
+  local tok = g.tokens
+  g:noteFrame(6)
+  T.check(not g:roomFor(4) and g:roomFor(8), 'noted work counts in the frame')
+  T.check(g.tokens == tok, 'but is not charged to the bucket')
+  t = t + 16; g:beginFrame(true)
+  T.check(g:roomFor(4), 'the next frame starts empty')
+  g:requestHeavy(true)
+  T.check(not g:roomFor(100), 'never in a heavy frame')
+end
 T.done('test_governor')

@@ -30,6 +30,7 @@ M.ownChanged = false                     -- our anchor changed since mpsession l
 local xfCache = {}                       -- [playerId] = { myLat, myLon, rLat, rLon, xf } (lazy, see transformFor)
 local installed = false
 local far = {}                           -- [serverVehicleString] = true: its last position was beyond FAR_M (isFar)
+local wasFar = {}                        -- [serverVehicleString] = true: it was beyond FAR_M at some time (wasFar)
 
 local function isMPSession()
   return MPCoreNetwork ~= nil and MPCoreNetwork.isMPSession ~= nil and MPCoreNetwork.isMPSession()
@@ -55,9 +56,12 @@ function M.knows(pid) return remote[tonumber(pid)] ~= nil end
 
 -- Was this remote car's last position (BeamMP's serverVehicleString "pid-vid") beyond FAR_M?
 function M.isFar(sid) return far[sid] == true end
+-- Was this remote car ever beyond FAR_M (where the game's physics break and the game deletes it)? (mpsession's restore)
+function M.wasFar(sid) return wasFar[sid] == true end
+function M._noteFar(sid) wasFar[sid] = true end       -- (tests)
 
 -- (the session's end) the remote anchors forgotten
-function M.reset() remote, xfCache, far = {}, {}, {} end
+function M.reset() remote, xfCache, far, wasFar = {}, {}, {}, {} end
 
 local function transformFor(pid)
   if not myLat then return nil end
@@ -109,7 +113,7 @@ local function wrapHandle(original)
     applyTransform(decoded, xf)
     local p = decoded.pos
     if p and tonumber(p[1]) and tonumber(p[2]) and p[1] * p[1] + p[2] * p[2] > M.FAR_M * M.FAR_M then
-      far[serverVehicleID] = true
+      far[serverVehicleID], wasFar[serverVehicleID] = true, true
       return
     end
     far[serverVehicleID] = nil

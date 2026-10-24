@@ -200,6 +200,8 @@ def _read_segs(path):
     except (OSError, ValueError, EOFError) as e:        # damaged: built again
         log.debug("road widths: %s: %s", path, e)
         return None
+    import cache as cachemod
+    cachemod.touch_once(path)           # (recent for the start-up prune: cache.prune_dir, STORE_MB)
     return a if a.dtype == np.float32 and a.ndim == 2 and a.shape[1] == 4 else None
 
 
@@ -246,6 +248,9 @@ def _write_segs(path, segs):
             os.remove(tmp)
         except OSError:
             pass
+
+
+STORE_MB = 1024             # the walls' files kept at most (earthd's start-up prune; 3.5 GB on a Steam Deck, 2026-10-23)
 
 
 def store_dir(cache_dir, md):

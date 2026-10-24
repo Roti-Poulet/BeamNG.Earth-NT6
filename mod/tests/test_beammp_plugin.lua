@@ -34,6 +34,16 @@ T.check(G.anchors(G.live())['1'].h == 90.5, 'anchors: the heading (the map arrow
 G.onPose(1, { v = G.PROTO, aLat = 36.2, aLon = -118, lat = 36.2, lon = -118, h = 'x' }, 'a')
 T.check(G.anchors(G.live())['1'].h == nil, 'anchors: a bad heading left out')
 
+-- config: the sharing port set at the top of main.lua, a bad one left out (each player's own default)
+T.check(G.config().sharePort == 47621, 'config: the default sharing port')
+G.SHARE_PORT = 50000
+T.check(G.config().sharePort == 50000, 'config: an edited port')
+for _, bad in ipairs({ 80, 70000, 'x' }) do
+  G.SHARE_PORT = bad
+  T.check(G.config().sharePort == nil, 'config: a bad port left out: ' .. tostring(bad))
+end
+G.SHARE_PORT = 47621
+
 -- peers: the sharing players on one anchor, the same sorted list for each; a player on another anchor alone
 G.players = {}
 G.onPose(1, { v = G.PROTO, aLat = 40, aLon = -111.9, lat = 40, lon = -111.9, sp = 47621, sc = 'c1' }, 'u1')

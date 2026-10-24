@@ -237,6 +237,19 @@ function Gov:chargeMotion(ms)
   self.frameSpent = self.frameSpent + ms
 end
 
+-- A frame's other work (navgraph, parking: not streaming units): counted in this frame's spent time, so the occasional
+-- big ones wait for a light frame instead of landing on the same one (roomFor), but not charged to the bucket.
+function Gov:noteFrame(ms)
+  self.frameSpent = self.frameSpent + max(0, ms or 0)
+end
+
+-- Is this frame light enough for an occasional op of the mod's own (navgraph's map rebuild, parking's spots, a
+-- collision rebuild): not a heavy frame and at most ms spent in it so far? (2026-10-23, a Steam Deck drive in Baltimore:
+-- a 66 ms parking rebuild, a 50 ms navgraph apply and 33 ms of world work in one 187 ms frame.)
+function Gov:roomFor(ms)
+  return self.heavyFrame ~= self.frame and (self.frameSpent or 0) <= ms
+end
+
 local function grant(self)
   self.heavyPending, self.heavySince = false, nil
   self.heavyFrame = self.frame

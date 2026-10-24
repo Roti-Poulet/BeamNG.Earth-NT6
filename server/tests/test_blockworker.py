@@ -168,7 +168,7 @@ class BasePhotoTest(unittest.TestCase):
             ys = y0 + np.arange(n) * (size / (n - 1))
             _, U = heightmap.surface(FRAME, lambda la, lo: FakeDem().sample(la, lo, 15), xs, ys)
             rgb = rockface.rock(np.asarray(rgb, np.uint8), FRAME, x0, y0, size, U, x0, y0, size / (n - 1))
-            Image.fromarray(rgb, "RGB").save(os.path.join(out, "server.png"), format="PNG", compress_level=1)
+            Image.fromarray(rgb, "RGB").save(os.path.join(out, "server.png"), format="PNG", compress_level=0)   # (as earthd.write_base)
             got = blockworker.base_photo(*args)
             self.assertIsNotNone(got, "the tiles on disk now")
             np.testing.assert_array_equal(got[0], rgb)
@@ -195,7 +195,7 @@ class BaseRoutingTest(unittest.TestCase):
         self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), "block_pools": []}), earthd.LANE_REQUEST))
         calls = []
 
-        def write_base(anchor, cx, cy, photo=None):
+        def write_base(anchor, cx, cy, photo=None, quick=False):
             calls.append((cx, cy))
             photo.append("here")
             return "here.png"

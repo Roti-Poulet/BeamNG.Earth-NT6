@@ -68,6 +68,7 @@ import netfetch
 import overture
 import rangeread
 import staging
+import xproc
 
 log = logging.getLogger("earthd.mapdata")
 
@@ -146,7 +147,9 @@ def digest_arrays(arrays):
 # the walls, ~90-160 MB, 2026-10-20); a mirrored layer is decompressed once per machine and its pages shared, dropped
 # instead of swapped under memory pressure. At most MIRROR_MB on disk (the least recently read go first); the vector
 # layers' `en` (the cell frame's metres, Features.localize) is kept with them.
+BUILD_WAIT_S = 180.0        # a cell layer another process is building is waited for this long (xproc.once)
 MIRROR_MB = 2048
+MIRROR_PRUNE_S = 120.0  # the mirror pruned at most this often per process (each prune walks it all)
 MIRROR_SMALL = 65536    # bytes: an array this small is read into memory (no mapping)
 MEM_MB = 192        # decoded cell layers kept in memory per process (a road tile reads its ~4 cells, each read by
                     # its neighbours too: ~8 ms of decompression and a coordinate transform each time, 2026-10-15).
@@ -358,6 +361,14 @@ class MapData:
                 if getattr(self, "osmtags", None) is None:
                     self.osmtags = osmtags.OsmTags(self.raw_dir, self.fetcher)
             return self.osmtags.cell(key.bounds(), kind)
+        except DEFERRED:
+            # a prefetch the host had no room for: the cell is not built now (MapData.prefetch: False) rather than cached
+            # for good without its tags (a player's start cell in Baltimore kept the roads' guesses, 2026-10-23); on
+            # demand the roads go on without them, as below
+            if kind not in ("demand", "urgent"):
+                raise
+            log.warning("mapdata: OSM road tags of %s: the host is busy (%s); the roads go on without them", key, kind)
+            return {}, []
         except Exception as e:          # optional: the roads go on with their guesses
             log.warning("mapdata: OSM road tags of %s: %s: %s", key, type(e).__name__, e)
             return {}, []
@@ -387,11 +398,16 @@ class MapData:
         if arrays is not None:
             return self._mirrored(key, layer, path, arrays), True
         with self._key_lock(key, layer):
-            arrays = self._load(path)           # another thread built it meanwhile
+            # another thread, or another of the server's processes (xproc), built it meanwhile
+            arrays, mine = xproc.once(path + ".lock", lambda: self._load(path), BUILD_WAIT_S, kind)
             if arrays is not None:
                 return self._mirrored(key, layer, path, arrays), True
-            arrays = self._build(key, layer, kind)
-            self._store(path, arrays)
+            try:
+                arrays = self._build(key, layer, kind)
+                self._store(path, arrays)
+            finally:
+                if mine:
+                    xproc.release(path + ".lock")
             return self._mirrored(key, layer, path, arrays), False
 
     # --- the uncompressed mirror (MIRROR_MB) ---------------------------------------------------
@@ -462,38 +478,26 @@ class MapData:
         got = self._mirror_load(path)
         return got if got is not None else arrays
 
-    _mirror_written = 0
+    # (a process's first write prunes: the count of a session's own writes alone never reached the threshold when
+    # each run wrote less, and the mirror grew past MIRROR_MB across sessions: 6.3 GB on a Steam Deck, 2026-10-23)
+    _mirror_written = MIRROR_MB * 1e6
+    _mirror_pruned = -1e9
     _mirror_lock = threading.Lock()
 
     def _mirror_note(self, nbytes):
         """Count what this process wrote; every MIRROR_MB / 8 of it, the mirror cut back to MIRROR_MB."""
         with MapData._mirror_lock:
             MapData._mirror_written += nbytes
-            if MapData._mirror_written < MIRROR_MB * 1e6 / 8:
+            now = time.monotonic()
+            # (at most every MIRROR_PRUNE_S: each prune walks the whole mirror, as dem.Dem's)
+            if MapData._mirror_written < MIRROR_MB * 1e6 / 8 or now - MapData._mirror_pruned < MIRROR_PRUNE_S:
                 return
-            MapData._mirror_written = 0
-        self._mirror_prune()
+            MapData._mirror_written, MapData._mirror_pruned = 0, now
+        # (beside the write: the walk stat()s every file, 0.5-1 s on a desktop, in the block build that wrote)
+        threading.Thread(target=self._mirror_prune, daemon=True, name="mapdata-mirror-prune").start()
 
     def _mirror_prune(self):
-        root = os.path.join(self.cache_dir, "mapdata-mirror")
-        entries, total = [], 0
-        for dirpath, dirnames, filenames in os.walk(root):
-            if "ok" in filenames:
-                try:
-                    n = sum(os.path.getsize(os.path.join(dirpath, f)) for f in filenames)
-                    entries.append((os.path.getmtime(os.path.join(dirpath, "ok")), n, dirpath))
-                    total += n
-                except OSError:
-                    pass
-                dirnames[:] = []
-        if total <= MIRROR_MB * 1e6:
-            return
-        import shutil
-        for _, n, dpath in sorted(entries):
-            shutil.rmtree(dpath, ignore_errors=True)
-            total -= n
-            if total <= 0.8 * MIRROR_MB * 1e6:
-                break
+        prune_mirror(self.cache_dir)
 
     # --- cells -----------------------------------------------------------------------------------
     def cell(self, key, layers=LAYERS, kind="demand"):
@@ -586,6 +590,33 @@ class MapData:
         except DEFERRED:
             return False
 
+
+
+def prune_mirror(cache_dir):
+    """The uncompressed mirror cut back to 80 % of MIRROR_MB when over it, the least recently written folders first
+    (a process's writes, and earthd at start: a session that only reads it never pruned it)."""
+    root = os.path.join(cache_dir, "mapdata-mirror")
+    entries, total = [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if "ok" in filenames:
+            try:
+                n = sum(os.path.getsize(os.path.join(dirpath, f)) for f in filenames)
+                entries.append((os.path.getmtime(os.path.join(dirpath, "ok")), n, dirpath))
+                total += n
+            except OSError:
+                pass
+            dirnames[:] = []
+    if total <= MIRROR_MB * 1e6:
+        return 0
+    import shutil
+    removed = 0
+    for _, n, dpath in sorted(entries):
+        shutil.rmtree(dpath, ignore_errors=True)
+        total -= n
+        removed += 1
+        if total <= 0.8 * MIRROR_MB * 1e6:
+            break
+    return removed
 
 # --- CLI ------------------------------------------------------------------------------------------
 LANDCOVER_RGB = {0: (255, 255, 255), 10: (0, 100, 0), 20: (255, 187, 34), 30: (255, 255, 76), 40: (240, 150, 255),

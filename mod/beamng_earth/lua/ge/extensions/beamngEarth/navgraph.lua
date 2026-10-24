@@ -12,6 +12,10 @@ local M = {}
 
 M.EDGE_M = 60           -- graph nodes this far inside the block's ground box only
 M.MIN_GAP_S = 1.0
+-- An apply (or its signals' second step) waits for a light frame (governor roomFor: at most APPLY_ROOM_MS of streaming
+-- and other work spent in it, not a terrain commit's), APPLY_WAIT_FRAMES at most
+M.APPLY_ROOM_MS = 4.0
+M.APPLY_WAIT_FRAMES = 30
 -- The block moved this far from where the graph was last clipped: clipped again to the new block (the server's graph
 -- reaches WINDOW_M = 1100 m, the block ~450 m; without it the graph ran out ahead of a car driving on before the next
 -- graph came, every 400 m: the GPS arrows ended and the autodrive stopped, the user's Cannonball run 2026-10-14)
@@ -87,11 +91,19 @@ end
 -- Pure-ish (needs vec3): the stock map's node table of graph g clipped to box b: {name = {pos, radius,
 -- links = {other = edge}}}, every edge shared by both ends (double-sided) with in/out nodes, positions and radii.
 -- Returns nodes, node count, edge count and the cuts: { x, y } of each kept node with a road to a node left out.
-function M.toNodes(g, b, edgeM, leftHand)
+function M.toNodes(g, b, edgeM, leftHand, yieldEvery)
   local nodes, nn, ne = {}, 0, 0
   local keep = {}
+  local steps = 0
+  local function step()       -- (in a coroutine: a pause every yieldEvery items, buildNodes)
+    if yieldEvery then
+      steps = steps + 1
+      if steps % yieldEvery == 0 then coroutine.yield() end
+    end
+  end
   for name, n in pairs(g.nodes) do
     if M.inside(b, n[1], n[2], edgeM) then keep[name] = n end
+    step()
   end
   local function node(name)
     local t = nodes[name]
@@ -105,6 +117,7 @@ function M.toNodes(g, b, edgeM, leftHand)
   end
   local cut, cutList = {}, {}
   for _, e in ipairs(g.edges) do
+    step()
     local a, bb = e[1], e[2]
     for _, pair in ipairs({ { a, bb }, { bb, a } }) do
       local k = pair[1]
@@ -244,14 +257,23 @@ local function signalsSystem()
   return core_trafficSignals
 end
 
-local function apply(b)
+local function setRules()
   -- the country's rules (server navgraph.road_rules): driving side, turn on red, red+yellow before green
   local r = graph.rules
   if r then
     M.rules = { rightHandDrive = r.rightHandDrive and true or false, turnOnRed = r.turnOnRed and true or false }
     M.SIGNAL_TYPE = r.redYellow and 'lightsBasicEU' or 'lightsBasic'
   end
-  local nodes, nn, ne, cl = M.toNodes(graph, b, M.EDGE_M, M.rules.rightHandDrive)
+end
+
+-- pre: toNodes' results built ahead (buildNodes), else made here
+local function apply(b, pre)
+  setRules()
+  local tN = os.clock()
+  local nodes, nn, ne, cl
+  if pre then nodes, nn, ne, cl = pre[1], pre[2], pre[3], pre[4]
+  else nodes, nn, ne, cl = M.toNodes(graph, b, M.EDGE_M, M.rules.rightHandDrive) end
+  stats.nodesMs = (os.clock() - tN) * 1000         -- (the parts of an apply's frame: the hitch hunt, 2026-10-23)
   local ts = signalsSystem()
   -- before the reset: its onNavgraphReloaded would place the old instances on the new graph (research §2.8)
   if ts then pcall(ts.resetSignals) end
@@ -266,7 +288,9 @@ local function apply(b)
   end
   local okG, gps = pcall(require, 'beamngEarth/gps')
   local mOld = map.getMap and map.getMap()
+  local tG = os.clock()
   local keep = okG and gps.beforeGraph and gps.beforeGraph(mOld and mOld.nodes) or nil
+  stats.gpsMs = (os.clock() - tG) * 1000
   local t0 = os.clock()
   ours = true
   local ok, err = pcall(map.reset, nodes)
@@ -286,7 +310,9 @@ local function apply(b)
   else
     persistent = m.nodes
   end
+  local tA = os.clock()
   if keep then pcall(gps.afterGraph, keep, m.nodes) end    -- before the vehicles' new map
+  stats.gpsMs = stats.gpsMs + (os.clock() - tA) * 1000
   be:queueAllObjectLua('mapmgr.requestMap()')
   -- the minimap (the navigation app, in 0.40's freeroam layout and ours) indexes the map's roads once and keeps them:
   -- it showed the first graph's streets, or none, as the player drove on (the user, 2026-10-22)
@@ -295,6 +321,7 @@ local function apply(b)
   pendingSignals = ts and nodes or nil     -- next frame: a second, smaller hitch instead of one big one
   cuts = cl
   stats.applies, stats.lastMs, stats.nodes, stats.edges = stats.applies + 1, (os.clock() - t0) * 1000, nn, ne
+  stats.applyMs = (os.clock() - tN) * 1000
   stats.cuts = #cl
   return true
 end
@@ -482,22 +509,70 @@ function M.boxMoved(a, b)
   return math.sqrt(dx * dx + dy * dy)
 end
 
-function M.update(aid, b)
+local waited = 0
+local stopwatch = require('beamngEarth/stopwatch')
+
+-- The node tables an apply hands map.reset, built over several frames (toNodes in a coroutine, PREP_MS a frame; ~20 ms in
+-- one frame on a Steam Deck), for this graph and block box; nil until done.
+M.PREP_MS = 2.0
+M.PREP_YIELD = 256
+local prep = nil        -- { graph, box, co, result }
+
+local function buildNodes(b)
+  if not prep or prep.graph ~= graph or not (prep.box == b or (prep.box and b and prep.box[1] == b[1] and prep.box[2] == b[2]
+      and prep.box[3] == b[3] and prep.box[4] == b[4])) then
+    setRules()
+    local g, box, rh = graph, b and { b[1], b[2], b[3], b[4] } or nil, M.rules.rightHandDrive
+    prep = { graph = g, box = box, co = coroutine.create(function()
+      return { M.toNodes(g, box, M.EDGE_M, rh, M.PREP_YIELD) }
+    end) }
+  end
+  if prep.result then return prep.result end
+  local sw = stopwatch.new()
+  repeat
+    local ok, res = coroutine.resume(prep.co)
+    if not ok then
+      log('W', 'beamngEarth', 'navgraph: nodes: ' .. tostring(res))
+      prep = nil
+      return nil
+    end
+    if coroutine.status(prep.co) == 'dead' then prep.result = res end
+  until prep.result or sw() >= M.PREP_MS
+  return prep.result
+end
+
+-- May the apply run in this frame (gov: the frame governor; nil: always)?
+local function room(gov)
+  if not (gov and gov.roomFor) or waited >= M.APPLY_WAIT_FRAMES or gov:roomFor(M.APPLY_ROOM_MS) then
+    waited = 0
+    return true
+  end
+  waited = waited + 1
+  return false
+end
+
+function M.update(aid, b, gov)
   if not M.enabled or not graph then return end
   local t0 = os.clock()
   if applied and t0 - lastGuard >= M.GUARD_S then
     lastGuard = t0
     local ok, err = pcall(guard, b, false)
     if not ok then log('W', 'beamngEarth', 'navgraph guard: ' .. tostring(err)) end
+    local g = (os.clock() - t0) * 1000
+    stats.guardMs = g
+    stats.guardMaxMs = math.max(stats.guardMaxMs or 0, g)
   end
   if graph.anchor ~= aid then
     graph = nil
     return
   end
   if pendingSignals then
+    if not room(gov) then return end
     local nodes = pendingSignals
     pendingSignals = nil
+    local sw = stopwatch.new()
     applySignals(nodes)
+    if gov and gov.noteFrame then gov:noteFrame(sw()) end
     return
   end
   -- a small block move alone does not re-apply (each apply is a ~40 ms frame); one of RECLIP_M does
@@ -505,9 +580,15 @@ function M.update(aid, b)
   if not (dirty or foreign) then return end
   local t = os.clock()
   if t - lastApply < M.MIN_GAP_S and not foreign then return end
+  local pre = buildNodes(b)
+  if not pre or not room(gov) then return end
+  prep = nil
   lastApply = t
   dirty, foreign = false, false
-  if apply(b) then
+  local sw = stopwatch.new()
+  local okA = apply(b, pre)
+  if gov and gov.noteFrame then gov:noteFrame(sw()) end
+  if okA then
     applied = { anchor = aid, serial = graph.serial, box = b and { b[1], b[2], b[3], b[4] } or {} }
     if not started then
       startTraffic()
@@ -538,7 +619,8 @@ function M.status()
   return { graph = graph and graph.serial or nil, applies = stats.applies, lastMs = stats.lastMs,
            nodes = stats.nodes, edges = stats.edges, junctions = stats.junctions, started = started,
            cuts = stats.cuts, cutRespawns = stats.cutRespawns,
-           resetMs = stats.resetMs, signalsMs = stats.signalsMs,
+           resetMs = stats.resetMs, signalsMs = stats.signalsMs, nodesMs = stats.nodesMs, gpsMs = stats.gpsMs,
+           applyMs = stats.applyMs, guardMs = stats.guardMs, guardMaxMs = stats.guardMaxMs,
            traffic = gameplay_traffic and gameplay_traffic.getState() or nil }
 end
 
@@ -552,6 +634,7 @@ function M.reset()
   cuts = {}
   M.restoreChoice()
   stats = { applies = 0, lastMs = 0, nodes = 0, edges = 0 }
+  prep, waited = nil, 0
 end
 
 return M

@@ -27,6 +27,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import fast
+import mapgeom
 import heightmap
 import mapcells
 import roads as roadsmod
@@ -237,6 +238,25 @@ def grid_affine(lat, lon):
     return f
 
 
+def _lonlat_boxes(feats):
+    """(n, 4) lon min / max, lat min / max of each feature's coordinates (+-inf for none), kept with the feats."""
+    got = feats.__dict__.get("_lonlat_boxes")
+    if got is not None:
+        return got
+    n = len(feats)
+    got = np.empty((n, 4))
+    got[:, 0::2], got[:, 1::2] = np.inf, -np.inf
+    a = feats.coord_off[feats.ring_off[feats.part_off[:-1]]]
+    b = feats.coord_off[feats.ring_off[feats.part_off[1:]]]
+    rows = np.flatnonzero(b > a)
+    if len(rows):
+        ll = feats.lonlat
+        for col, (u, f) in enumerate([(0, np.minimum), (0, np.maximum), (1, np.minimum), (1, np.maximum)]):
+            got[rows, col] = mapgeom._reduce(f, ll[:, u], a[rows], b[rows])
+    feats.__dict__["_lonlat_boxes"] = got
+    return got
+
+
 def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, extra=()):
     """idx (material per sample, [row, col], as classify gives it) with the roads of feats_list (the
     "roads" Features of the cells around) drawn in at their width: ROAD_MATERIAL by surface kind.
@@ -281,11 +301,20 @@ def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, e
         if feats is None or len(feats) == 0:
             continue
         specs = roadsmod.road_specs(feats, urban_fn, widths)
+        box = _lonlat_boxes(feats)
+        bc, br = to_px(box[:, [0, 1, 0, 1]], box[:, [2, 2, 3, 3]])     # the boxes' corners on the grid
+        c_lo, c_hi, r_lo, r_hi = bc.min(1), bc.max(1), br.min(1), br.max(1)
+        ids = feats.ids.tolist()
         for i in range(len(feats)):
-            fid = str(feats.ids[i])
+            fid = str(ids[i])
             if specs[i] is None or fid in seen:
                 continue
             seen.add(fid)
+            # (all of it off the grid, with room for everything drawn beside it: no sample of it is painted)
+            m = (specs[i].width + 2 * AISLE_STALLS_M + 2 * (specs[i].walk + square) + 2 * VERGE_M
+                 + 3 * roadsmod.median_width(specs[i])) / square + 4
+            if not (c_hi[i] >= -m and c_lo[i] <= w + m and r_hi[i] >= -m and r_lo[i] <= h + m):
+                continue
             aisle = specs[i].kind == "paved" and \
                 roadsmod._rule_value(feats.rules.get("subclass"), i) == "parking_aisle"
             mw = roadsmod.median_width(specs[i])
@@ -337,15 +366,20 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
         if feats is None or len(feats) == 0:
             continue
         specs = roadsmod.road_specs(feats, urban_fn, widths)
+        box = _feature_boxes(feats, frame)
+        ids = feats.ids.tolist()
         for i in range(len(feats)):
-            fid = str(feats.ids[i])
+            fid = str(ids[i])
             sp = specs[i]
             if sp is None or fid in seen or sp.kind not in PHOTO_ROAD_RGBA:
                 continue
             seen.add(fid)
+            m = sp.width / 2        # (all of the feature off the photo: none of its rings is in it)
+            if box[i, 1] < x0 - m or box[i, 0] > x0 + size + m or box[i, 3] < y0 - m or box[i, 2] > y0 + size + m:
+                continue
             hw = sp.width * px_m / 2
             for ring in roadsmod.ground_parts(feats, i):
-                e, n, _ = frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+                e, n = mapgeom.enu_xy(feats, frame, ring)
                 c = (np.asarray(e) - x0) * px_m
                 r = (y0 + size - np.asarray(n)) * px_m
                 if len(c) < 2 or c.max() < -hw or c.min() > w + hw or r.max() < -hw or r.min() > h + hw:
@@ -356,6 +390,30 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
     if not segs:
         return None
     return np.concatenate(segs), np.concatenate(hws), np.concatenate(kind)
+
+
+def _feature_boxes(feats, frame):
+    """(n, 4) east min / max, north min / max of each feature's coordinates in frame (+-inf for none); kept with the
+    feats per frame, as their converted coordinates (mapgeom.Features.xy_in)."""
+    key = (frame.lat0, frame.lon0, frame.h0)
+    memo = feats.__dict__.setdefault("_boxes_in", {})
+    got = memo.get(key)
+    if got is not None:
+        return got
+    n = len(feats)
+    got = np.empty((n, 4))
+    got[:, 0::2], got[:, 1::2] = np.inf, -np.inf
+    a = feats.coord_off[feats.ring_off[feats.part_off[:-1]]]
+    b = feats.coord_off[feats.ring_off[feats.part_off[1:]]]
+    rows = np.flatnonzero(b > a)
+    if len(rows):
+        xy = feats.xy_in(frame)
+        for col, (u, f) in enumerate([(0, np.minimum), (0, np.maximum), (1, np.minimum), (1, np.maximum)]):
+            got[rows, col] = mapgeom._reduce(f, xy[:, u], a[rows], b[rows])
+    if len(memo) >= 2:
+        memo.pop(next(iter(memo)))
+    memo[key] = got
+    return got
 
 
 def photo_roads(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None):

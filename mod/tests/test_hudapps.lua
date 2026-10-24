@@ -24,6 +24,9 @@ T.check(not H.any() and not H.mounted('status'), 'all apps gone')
 T.check(H.minimapName({ street = 'Thames Street', place = 'Baltimore' }) == 'Baltimore', 'minimap label: the town')
 T.check(H.minimapName({ street = 'Thames Street', place = '' }) == 'Thames Street', 'minimap label: the street until the town is known')
 T.check(H.minimapName({ street = '', place = '' }) == nil and H.minimapName(nil) == nil, 'minimap label: nothing known, stock fallback')
+T.check(H.coordsLabel(39.2834, -76.5934) == '39.28340° N, 76.59340° W', 'minimap label: the Earth coordinates')
+T.check(H.coordsLabel(-33.8688, 151.2093) == '33.86880° S, 151.20930° E', 'south and east')
+T.check(H.coordsLabel(nil, 1) == nil and H.coordsLabel(0 / 0, 1) == nil, 'no coordinates: none')
 local levelZone = nil
 gameplay_city = { getHighestPrioZone = function() return levelZone end }
 local orig = gameplay_city.getHighestPrioZone

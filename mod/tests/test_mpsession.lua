@@ -11,6 +11,13 @@ local ms = require('beamngEarth/mpsession')
 local hide = ms.toHide({ [10] = 1, [11] = 2, [12] = 3 }, function(pid) return pid == 1 or pid == 2 end)
 T.check(not hide[10] and not hide[11] and hide[12], 'toHide: an unknown anchor hidden, known ones not')
 
+-- pure: the share request carries the server's sharing port (bngeConfig) when it is a usable one
+T.check(ms.shareRequest({ sharePort = 50000 }).port == 50000, 'shareRequest: the server\'s port')
+T.check(ms.shareRequest(nil).port == nil and ms.shareRequest(nil).type == 'share', 'shareRequest: no settings')
+for _, bad in ipairs({ 80, 70000, 5.5, 'x' }) do
+  T.check(ms.shareRequest({ sharePort = bad }).port == nil, 'shareRequest: a bad port left out: ' .. tostring(bad))
+end
+
 -- BeamMP's client API, stubbed
 local handlers, sent = {}, {}
 function AddEventHandler(name, fn) handlers[name] = fn end
@@ -78,7 +85,8 @@ handlers.bngeGoTo('t')
 T.check(asked.go == nil, 'go-to once a session')
 
 -- damage: due when a player comes near; after a change of DAMAGE_STEP that held DAMAGE_SETTLE_S
-T.check(ms.damageDue(true, 0, 0, 0, 0.5) == true, 'damage: a newcomer: sent')
+T.check(ms.damageDue(true, 500, 0, 0, 0.5) == true, 'damage: a newcomer sees a damaged car: sent')
+T.check(ms.damageDue(true, 0, 0, 0, 0.5) == false, 'damage: a newcomer and an undamaged car: nothing to send')
 local due, settled = ms.damageDue(false, 10, 0, 0, 0.5)
 T.check(due == false and settled == 0, 'damage: a small change: not sent')
 due, settled = ms.damageDue(false, 500, 0, 0, 0.5)
@@ -99,12 +107,17 @@ ms.sendDamage(36.5, -118.1, 0.5)
 T.check(#cmds == 0, 'damage: nobody near: nothing sent')
 handlers.bngeAnchors('n')
 ms.sendDamage(36.5, -118.1, 0.5)
-T.check(#cmds == 1 and cmds[1]:find('nodesVE.getNodes', 1, true), 'damage: sent to a player who came near')
-ms.sendDamage(36.5, -118.1, 0.5)
-T.check(#cmds == 1, 'damage: not again while nothing changes')
+T.check(#cmds == 0, 'damage: a player came near, our car undamaged: nothing to send')
 map.objects[20].damage = 900
 for _ = 1, 6 do ms.sendDamage(36.5, -118.1, 0.5) end
-T.check(#cmds == 2, 'damage: sent once after it changed and settled: ' .. #cmds)
+T.check(#cmds == 1 and cmds[1]:find('nodesVE.getNodes', 1, true), 'damage: sent once after it changed and settled: ' .. #cmds)
+ms.sendDamage(36.5, -118.1, 0.5)
+T.check(#cmds == 1, 'damage: not again while nothing changes')
+handlers.bngeAnchors('f')
+ms.sendDamage(36.5, -118.1, 0.5)
+handlers.bngeAnchors('n')
+ms.sendDamage(36.5, -118.1, 0.5)
+T.check(#cmds == 2, 'damage: the damaged car to a player who came near again: ' .. #cmds)
 
 -- others: the map's arrows, every player but us, with names and headings
 decoded.o = { ['1'] = { aLat = 36.5, aLon = -118.1, lat = 36.5, lon = -118.1, name = 'me', h = 10 },
@@ -126,7 +139,9 @@ end
 decoded.r = { ['2'] = { aLat = 36.6, aLon = -118.0, lat = 36.5005, lon = -118.1 },
   ['3'] = { aLat = 40, aLon = -100, lat = 40, lon = -100 } }
 handlers.bngeAnchors('r')
-T.check(ms.restoreDeleted(36.5, -118.1) == 1 and restored[1] == 'bob', 'deleted car of a near player: restored')
+T.check(ms.restoreDeleted(36.5, -118.1) == 0, 'a car removed here on purpose (never out of our world): left removed')
+require('beamngEarth/mpanchor')._noteFar('2-0')
+T.check(ms.restoreDeleted(36.5, -118.1) == 1 and restored[1] == 'bob', 'deleted car of a near player that was out of our world: restored')
 T.check(ms.restoreDeleted(36.5, -118.1) == 0, 'not again at once')
 MPVehicleGE.getVehicles = oldGet
 

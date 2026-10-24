@@ -26,7 +26,6 @@ from dataclasses import dataclass
 import numpy as np
 
 import fast
-from polygon import Path
 
 import mapcells
 import pacer
@@ -109,15 +108,10 @@ def _hash01(a, b, salt):
 
 
 def _shift_max(a, r):
-    """The maximum over the (2r+1)^2 window around each pixel (edges padded with -inf)."""
-    p = np.pad(a, r, constant_values=-np.inf)
-    out = np.full(a.shape, -np.inf, a.dtype)
-    n, m = a.shape
-    for dj in range(2 * r + 1):
-        for di in range(2 * r + 1):
-            if (dj - r) ** 2 + (di - r) ** 2 <= r * r + r:      # a disc, not a square
-                np.maximum(out, p[dj:dj + n, di:di + m], out=out)
-    return out
+    """The maximum over the disc of radius r around each pixel ((dj - r)^2 + (di - r)^2 <= r * r + r; outside the
+    array -inf; float32). earthfast disc_max (2026-10-23: the numpy version's full-array pass per disc offset)."""
+    fast.require(64, "disc_max")
+    return fast._ef.disc_max(np.ascontiguousarray(a, np.float32), int(r))
 
 
 def _dilate(m, r):
@@ -501,31 +495,13 @@ class Vegetation:
 
 def _thin(jj, ii, h, px):
     """Non-maximum suppression: the tallest tops first, each removing the others within its crown
-    radius (0.12 h + 1 m, times CROWN_SPACING). Deterministic (ties broken by position)."""
+    radius (0.12 h + 1 m, times CROWN_SPACING). Deterministic (ties broken by position). earthfast thin_tops
+    (2026-10-23: the same tops as the Python loop it replaced)."""
     if len(jj) == 0:
         return jj, ii
-    order = np.lexsort((ii, jj, -h))
-    rad = (CROWN_SPACING * (0.12 * h + 1.0) / px)
-    cell = max(1, int(np.ceil(rad.max())))
-    grid = {}
-    keep = np.zeros(len(jj), bool)
-    for k in order:
-        j, i, r = jj[k], ii[k], rad[k]
-        gj, gi = j // cell, i // cell
-        ok = True
-        for a in (gj - 1, gj, gj + 1):
-            for b in (gi - 1, gi, gi + 1):
-                for m in grid.get((a, b), ()):
-                    if (jj[m] - j) ** 2 + (ii[m] - i) ** 2 < max(r, rad[m]) ** 2:
-                        ok = False
-                        break
-                if not ok:
-                    break
-            if not ok:
-                break
-        if ok:
-            keep[k] = True
-            grid.setdefault((gj, gi), []).append(k)
+    fast.require(64, "thin_tops")
+    keep = fast._ef.thin_tops(np.ascontiguousarray(jj, np.int64), np.ascontiguousarray(ii, np.int64),
+                              np.ascontiguousarray(h, np.float32), float(CROWN_SPACING), float(px))
     return jj[keep], ii[keep]
 
 
@@ -555,36 +531,21 @@ def _to4326(x, y):
     return np.degrees(x / R), np.degrees(2 * np.arctan(np.exp(y / R)) - np.pi / 2)
 
 
-def _grid(chm, mx, my):
-    """Fractional (col, row) of EPSG:3857 points on the CHM grid."""
-    return (np.asarray(mx) - chm.x0) / chm.dx, (chm.y0 - np.asarray(my)) / chm.dy
-
-
 def _mask_polys(f, mask, chm, grow_m, kind=3, select=None):
-    """Mark the polygons of Features f (buildings, water) on the CHM-grid mask, grown by grow_m (select: a
-    bool per feature, only those)."""
+    """Mark the polygons of Features f (buildings, water) on the CHM-grid mask (bool, C order): every pixel whose
+    centre lies inside a part (its rings XOR'd, matplotlib's point-in-path test), within the part's box grown by
+    grow_m (select: a bool per feature, only those). The native module's (earthfast mask_polys, 2026-10-23: the same
+    pixels as the per-polygon Python loop it replaced, 13x faster: half of a tree cell's build)."""
     if f is None:
         return
-    n_r, n_c = mask.shape
-    g = grow_m / chm.dx
-    for i in np.flatnonzero((f.kind == kind) & (True if select is None else select)):
-        for part in f.parts(i):
-            rings = []
-            for ring in part:
-                x, y = _to3857(ring[:, 0], ring[:, 1])
-                rings.append(np.stack(_grid(chm, x, y), -1))
-            allp = np.concatenate(rings)
-            c0, r0 = int(np.floor(allp[:, 0].min() - g)), int(np.floor(allp[:, 1].min() - g))
-            c1, r1 = int(np.ceil(allp[:, 0].max() + g)) + 1, int(np.ceil(allp[:, 1].max() + g)) + 1
-            c0, r0, c1, r1 = max(c0, 0), max(r0, 0), min(c1, n_c), min(r1, n_r)
-            if c1 <= c0 or r1 <= r0:
-                continue
-            gc, gr = np.meshgrid(np.arange(c0, c1) + 0.5, np.arange(r0, r1) + 0.5)
-            pts = np.stack([gc.ravel(), gr.ravel()], -1)
-            inside = np.zeros(len(pts), bool)
-            for r in rings:
-                inside ^= Path(r).contains_points(pts)
-            mask[r0:r1, c0:c1] |= inside.reshape(r1 - r0, c1 - c0)
+    fast.require(62, "vegetation mask_polys")
+    feats = np.flatnonzero((f.kind == kind) & (True if select is None else select)).astype(np.int64)
+    if not len(feats):
+        return
+    fast._ef.mask_polys(mask.view(np.uint8), np.ascontiguousarray(f.lonlat, np.float64),
+                        np.ascontiguousarray(f.coord_off, np.int64), np.ascontiguousarray(f.ring_off, np.int64),
+                        np.ascontiguousarray(f.part_off, np.int64), feats, float(chm.x0), float(chm.y0),
+                        float(chm.dx), float(chm.dy), grow_m / chm.dx)
 
 
 def _mask_roads(f, mask, chm, push=None, clear=ROAD_CLEAR_M):
@@ -595,27 +556,21 @@ def _mask_roads(f, mask, chm, push=None, clear=ROAD_CLEAR_M):
         return
     n_r, n_c = mask.shape
     cls = f.attrs.get("class", np.full(len(f.kind), "", object))
-    fast.require(0, "road_corridors")
-    segs, hws = [], []                  # every segment in order: one Rust call at the end
-    for i in np.flatnonzero(f.kind == 2):
-        if str(cls[i]) in PATH_CLASSES:
-            continue
-        hw_m = ROAD_HALF_WIDTH_M.get(str(cls[i]), ROAD_HALF_DEFAULT_M) + clear
-        for part in f.parts(i):
-            for ring in part:
-                # ground metres to Web-Mercator pixels (a 3857 metre is 1 / cos(lat) of a ground metre)
-                hw = hw_m / (chm.dx * max(math.cos(math.radians(float(np.mean(ring[:, 1])))), 0.05))
-                x, y = _to3857(ring[:, 0], ring[:, 1])
-                c, r = _grid(chm, x, y)
-                q = np.stack([c, r], -1)
-                if (q[:, 0].max() < -hw or q[:, 1].max() < -hw or q[:, 0].min() > n_c + hw
-                        or q[:, 1].min() > n_r + hw):
-                    continue
-                segs.append(np.concatenate([q[:-1], q[1:]], 1))
-                hws.append(np.full(len(q) - 1, hw))
-    if segs:                            # the distances, the nearest road's push, without the GIL
-        fast._ef.road_corridors(mask, push, np.ascontiguousarray(np.concatenate(segs), np.float64),
-                                np.ascontiguousarray(np.concatenate(hws), np.float64))
+    fast.require(63, "road_segments")
+    sel = [i for i in np.flatnonzero(f.kind == 2) if str(cls[i]) not in PATH_CLASSES]
+    if not sel:
+        return
+    hw_m = np.array([ROAD_HALF_WIDTH_M.get(str(cls[i]), ROAD_HALF_DEFAULT_M) + clear for i in sel], np.float64)
+    # every ring's segments on the CHM grid, its half width in grid pixels (a 3857 metre is 1 / cos(lat) of a ground
+    # metre), rings off the grid left out (earthfast road_segments, 2026-10-23: the per-ring Python loop it
+    # replaced gave the same segments); then the distances and the nearest road's push, without the GIL
+    segs, hws = fast._ef.road_segments(np.ascontiguousarray(f.lonlat, np.float64),
+                                       np.ascontiguousarray(f.coord_off, np.int64),
+                                       np.ascontiguousarray(f.ring_off, np.int64),
+                                       np.ascontiguousarray(f.part_off, np.int64), np.asarray(sel, np.int64), hw_m,
+                                       float(chm.x0), float(chm.y0), float(chm.dx), float(chm.dy), n_r, n_c)
+    if len(hws):
+        fast._ef.road_corridors(mask, push, np.ascontiguousarray(segs), np.ascontiguousarray(hws))
 
 
 # --- tiles for the mod --------------------------------------------------------------------------------
@@ -747,6 +702,11 @@ class Tracker:
         if self.pool is not None:
             self.pool.shutdown(wait=False, cancel_futures=True)
 
+    def progress(self):
+        """(done, wanted) of the tiles round the car at the last pose (done: sent to the mod); (0, 0) before one."""
+        car = getattr(self, "car", ())
+        return sum(1 for k in car if k in self.sent), len(car)
+
     def on_pose(self, conn, aid, x, y, loop, build, view=None, foci=()):
         """As roads.Tracker.on_pose: the tiles within send_m of the car (x, y) and of the camera when it is away
         (view), the car's first; dropped beyond drop_m of both. foci: other vehicles' collision foci (x, y, r, ...)
@@ -762,6 +722,7 @@ class Tracker:
         spots = [(x, y)] + ([tuple(view)] if view else [])
         skip = {k for p in spots for k in roadsmod.tiles_near(*p, self.skip_m)} if self.skip_m else ()
         car = set(roadsmod.tiles_near(x, y, self.send_m))
+        self.car = car - set(skip)          # (progress: the loading line's tiles)
         seen = set(roadsmod.tiles_near(*view, self.send_m)) - car if view else set()
         others = set()
         for f in foci:

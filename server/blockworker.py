@@ -27,10 +27,12 @@ import grading as gradingmod
 import heightmap
 import mapdata as mapdatamod
 import netfetch
+import plancache
 import roadwidth as roadwidthmod
 import seacarve as seacarvemod
 import surface as surfacemod
 import terraincache
+import xproc
 
 log = logging.getLogger("earthd.blockworker")
 
@@ -75,6 +77,8 @@ class _State:
                 if self.graders[aid] is not None:
                     self.graders[aid].wet = self.sea.depth if getattr(self, "sea", None) is not None else None
                     self.graders[aid].dem = self.dem          # (its urgent lane: _plan_missing)
+                    self.graders[aid].shared = plancache.for_grader(self.cache_dir, self.graders[aid], self.widths,
+                                                                   self.graders[aid].wet)
                 for old in sorted(self.chunks)[:-ANCHORS_KEPT]:
                     del self.chunks[old], self.graders[old]
             return self.graders[aid], self.chunks[aid]
@@ -124,12 +128,17 @@ def _trace_memory(every_s=60.0, top=10):
 
 
 def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_level=logging.INFO, airports=False,
-         sea=False, nice=0):
+         sea=False, nice=0, roads_in_ground=None):
     """nice: this worker's niceness on top of the server's (earthd NICE_*): the terrain blocks' workers keep the
     server's own, the road tiles' and the far field's run below them, so the ground under the car wins the server's
     few cores (2026-10-19: at 180 mph the next block waited 6 s behind the road tiles ahead and a ball fell off the
     block's edge)."""
     global _s
+    # A helper may serve clients with different choices. Never use its own launcher
+    # preference for a client's job, or mix painted and mesh roads within one world.
+    if roads_in_ground is not None:
+        import roads as roadsmod
+        roadsmod.ROADS_IN_GROUND = roads_in_ground
     import budget
     try:
         budget.lower_priority(nice, worker=True)    # (Windows: the far field's workers idle, budget.WIN_IDLE_ABOVE)
@@ -141,6 +150,7 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
         _trace_memory()
     import sampler
     sampler.maybe_start(f".{os.getpid()}")      # BNGE_SAMPLE: this worker's own sampling profile (debugging)
+    xproc.PRIORITY = nice
     _s = _State(cache_dir, offline, roads, grading, road_widths, surface, airports, sea)
     threading.Thread(target=_watch_parent, args=(os.getppid(),), daemon=True, name="parent-watch").start()
     threading.Thread(target=_read_warm, args=(warm_q,), daemon=True, name="warm-read").start()
@@ -578,7 +588,9 @@ def base_photo(lat, lon, x0, y0, size, px, tex, buildings, rock_zoom, path, cach
     except Exception as e:
         log.debug("base photo: rock faces: %s", e)
     tmp = staging.tmp_for(path)
-    Image.fromarray(rgb, "RGB").save(tmp, format="PNG", compress_level=1)
+    # stored, not deflated: the game reads the packed cache entry (terraincache), this file only if that is stale;
+    # level 1 was 0.15 s of a block photo on a Steam Deck, level 0 0.08 (3 MB, a session keeps a few)
+    Image.fromarray(rgb, "RGB").save(tmp, format="PNG", compress_level=0)
     staging.replace(tmp, path)
     user_dir, base_vfs, ao_vfs, ao_value = cache
     terraincache.base_entry(user_dir, base_vfs, ao_vfs, rgb, ao_value)
@@ -650,8 +662,13 @@ def _accounted(fn):
             now = time.monotonic()
             if now - _cpu_logged[0] >= CPU_LOG_S:
                 _cpu_logged[0] = now
-                log.debug("worker %d cpu: %s", os.getpid(),
-                          ", ".join(f"{k} {v[0]} jobs {v[1]:.1f} s" for k, v in sorted(_cpu.items())))
+                shared = [g.shared.stats for g in list(getattr(_s, "graders", {}).values())
+                          if g is not None and g.shared is not None]
+                log.debug("worker %d cpu: %s%s", os.getpid(),
+                          ", ".join(f"{k} {v[0]} jobs {v[1]:.1f} s" for k, v in sorted(_cpu.items())),
+                          "; shared road plans " + ", ".join(f"{k} {sum(st[k] for st in shared):.0f}"
+                                                             for k in ("read", "written", "waited", "wait_s"))
+                          if shared else "")
     return run
 
 

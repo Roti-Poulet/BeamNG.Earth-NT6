@@ -33,11 +33,12 @@ end
 function M.mounted(name) return mounted[name] == true end
 function M.any() return nMounted > 0 end
 
--- Pure: the payload for the apps. t: { status, credits, banner = { text, level, visible }, hidden }
+-- Pure: the payload for the apps. t: { status, loading, credits, banner = { text, level, visible }, hidden }
 function M.payload(t)
   local b = t.banner or {}
   return {
     status = t.status or '',
+    loading = t.loading or '',          -- the status bar's second line (statusbar.loading)
     credits = t.credits or '',
     banner = (b.visible and b.text ~= '' and b.text) or '',
     bannerLevel = b.level or 'info',
@@ -46,7 +47,7 @@ function M.payload(t)
 end
 
 local function key(p)
-  return p.status .. '\1' .. p.credits .. '\1' .. p.banner .. '\1' .. p.bannerLevel .. '\1' .. tostring(p.hidden)
+  return p.status .. '\1' .. p.loading .. '\1' .. p.credits .. '\1' .. p.banner .. '\1' .. p.bannerLevel .. '\1' .. tostring(p.hidden)
 end
 
 -- now: core's clock (s); get(): the texts (only called when a send is due, so its cost is paid at SEND_S at most).
@@ -69,6 +70,15 @@ end
 -- level's title, "BeamNG.Earth" in our level, which has no zones. The town of the status bar's location takes the
 -- zones' place (the street until the town is known): getHighestPrioZone is wrapped while in our level, a level's own
 -- zone still first. Its callers (the minimap, photo mode's speed camera) only read the zone's name.
+-- The label is the car's Earth coordinates (the user, 2026-10-23: "change the info above the minimap to be the earth
+-- coordinates"); minimapName (the town) is kept for a label without them.
+-- Pure: "39.28340° N, 76.59340° W" for a latitude / longitude, nil without them.
+function M.coordsLabel(lat, lon)
+  lat, lon = tonumber(lat), tonumber(lon)
+  if not lat or not lon or lat ~= lat or lon ~= lon then return nil end
+  return string.format('%.5f° %s, %.5f° %s', math.abs(lat), lat >= 0 and 'N' or 'S', math.abs(lon), lon >= 0 and 'E' or 'W')
+end
+
 -- Pure: the label for a location { street, place, region, country }, or nil (the stock fallback).
 function M.minimapName(l)
   if not l then return nil end

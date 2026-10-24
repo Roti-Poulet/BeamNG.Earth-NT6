@@ -1,6 +1,8 @@
 """peerwork.py: compute sharing's wire format (no pickle), the job checks, the Built round trip, and a requester using
 a helper (and building locally when the helper is gone or of another code)."""
 import socket
+import tempfile
+from unittest import mock
 import sys
 import threading
 import unittest
@@ -57,7 +59,7 @@ class CheckTest(unittest.TestCase):
         op, settings, kw = peerwork.check_job(header())
         self.assertEqual(op, "far_geometry")
         self.assertEqual(kw["tile"].key, "1_-2_3")
-        self.assertEqual(settings, (True, True, False, False, False))
+        self.assertEqual(settings, (True, True, False, False, False, True))
 
     def test_bad_jobs_refused(self):
         for bad in (header(op="os.system"), header(lat=91.0), header(lon=float("nan")), header(tile=[1, 2]),
@@ -257,6 +259,80 @@ class GroupTest(unittest.TestCase):
         out = [pool.submit(far_geometry, *a).result(20) for a in args]
         self.assertTrue(all(isinstance(o, farfield.Built) for o in out))
         self.assertEqual(sorted(local.built), sorted(a[3].key for a in args))
+
+
+class SharedRenderingTest(unittest.TestCase):
+    def test_missing_mode_keeps_terrain_default(self):
+        _, settings, _ = peerwork.check_job(header())
+        self.assertIs(settings[-1], True)
+
+    def test_job_settings_include_rendering_mode(self):
+        for mode in (False, True):
+            with self.subTest(terrain=mode):
+                _, settings, _ = peerwork.check_job(header(settings={"roads": True, "roads_in_ground": mode}))
+                self.assertIn("roads_in_ground", peerwork.SETTINGS)
+                self.assertEqual(settings[peerwork.SETTINGS.index("roads_in_ground")], mode)
+
+    def test_job_cache_separates_modes(self):
+        terrain = header(settings={"roads": True, "roads_in_ground": True})
+        mesh = header(settings={"roads": True, "roads_in_ground": False})
+        self.assertNotEqual(peerwork.job_key(terrain), peerwork.job_key(mesh))
+
+    def test_group_refuses_other_rendering_before_building(self):
+        for local_mode in (False, True):
+            with self.subTest(terrain=local_mode):
+                pool = peerwork.SharedFarPool(None, [], {"roads": True, "roads_in_ground": local_mode}, None)
+                try:
+                    h = header(settings={"roads": True, "roads_in_ground": not local_mode})
+                    with self.assertRaisesRegex(ValueError, "other world settings"):
+                        pool.serve(h, lambda *_: self.fail("must reject before resolving anchor"), None)
+                finally:
+                    pool.io.shutdown(wait=True)
+
+    def test_helper_separates_pools_and_forwards_mode(self):
+        import pools
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pools, "RespawningPool") as factory:
+            factory.side_effect = [object(), object()]
+            helper = peerwork.Helper(tmp, 1, tmp)
+            for mode in (False, True):
+                _, settings, _ = peerwork.check_job(header(settings={"roads": True, "roads_in_ground": mode}))
+                pool = helper.pool(settings)
+                self.assertIs(helper.pool(settings), pool)
+                self.assertIs(factory.call_args.kwargs["initargs"][-1], mode)
+                factory.call_args.kwargs["initargs"][6].close()
+            self.assertEqual(factory.call_count, 2)
+
+    def test_invalid_wire_mode_is_rejected(self):
+        for bad in ("false", "mesh", 0, None, []):
+            with self.subTest(mode=bad), self.assertRaises(ValueError):
+                peerwork.check_job(header(settings={"roads_in_ground": bad}))
+
+    def test_spawned_worker_uses_requester_mode_over_its_environment(self):
+        import multiprocessing
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+        import blockworker
+        ctx = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in (False, True):
+                with self.subTest(terrain=mode), mock.patch.dict(os.environ, {
+                    "LOCALAPPDATA": tmp, "XDG_CONFIG_HOME": tmp, "HOME": tmp, "USERPROFILE": tmp,
+                    "BNGE_ROADS_IN_GROUND": "0" if mode else "1", "BNGE_SAMPLE": "", "BNGE_TRACEMALLOC": "",
+                }):
+                    warm = ctx.Queue(maxsize=1)
+                    try:
+                        with ProcessPoolExecutor(1, mp_context=ctx, initializer=blockworker.init,
+                                                 initargs=(tmp, True, False, False, False, False, warm,
+                                                           30, False, False, 0, mode)) as pool:
+                            self.assertIs(pool.submit(worker_rendering_mode).result(30), mode)
+                    finally:
+                        warm.close()
+                        warm.join_thread()
+
+
+def worker_rendering_mode():
+    import roads
+    return roads.ROADS_IN_GROUND
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ Layout of the cache root (~/.cache/beamng-earth by default):
   gravity/            counted, never evicted or cleared (the 145 MB EGM2008 model, downloaded once)
   airports/           the same (airports.py: OurAirports' CSV files, ~17 MB, the last good copy kept for
                       offline use; airports.py replaces it weekly and deletes the old generation itself)
+  seacarve/ (its raw rasters) peercache/ roadwidth/   their own limits (seacarve.RAW_MB, peerwork.CACHE_BYTES,
+                      roadwidth.STORE_MB), cut back at server start (prune_dir; their readers touch_once what they use)
+  mapdata-mirror/ dem's mirror            their own limits, pruned by their writers (a process's first write too)
   netstats/ (and anything else)           not tracked: the daily request budgets must survive a clear
 
 Last use = the server's own record of every disk hit and write (dem.py, imagery.py, the de-shadow and
@@ -509,6 +512,54 @@ class Cache(NoCache):
             self._thread.join(5.0)
         if self.ready:
             self.save()
+
+
+def prune_dir(root, max_bytes, keep_s=600.0, match=None, now=None):
+    """The caches that keep their own files outside MANAGED (sea carving's raw rasters, compute sharing's replies,
+    the road widths' walls): the oldest files (mtime; their readers touch the ones they use) under root removed until
+    at most max_bytes are left; files changed within keep_s stay; match(file name) selects files (None: all). A file
+    that cannot be removed (mapped by a running process on Windows) is skipped. -> (files removed, bytes left)"""
+    now = time.time() if now is None else now
+    files, total = [], 0
+    for dirpath, _dirs, names in os.walk(root):
+        for n in names:
+            if match is not None and not match(n):
+                continue
+            p = os.path.join(dirpath, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+    removed = 0
+    if total > max_bytes:
+        for mtime, size, p in sorted(files):
+            if total <= max_bytes * LOW_WATER or now - mtime < keep_s:
+                break
+            try:
+                os.remove(p)
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+    return removed, total
+
+
+_touched = set()
+_touched_lock = threading.Lock()
+
+
+def touch_once(path):
+    """Mark a self-managed cache file used (its mtime now, prune_dir's order), once per process."""
+    with _touched_lock:
+        if path in _touched:
+            return
+        _touched.add(path)
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
 
 
 def _gb(b):

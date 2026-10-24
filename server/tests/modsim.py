@@ -138,6 +138,7 @@ def follow_table(size=1024):
     F = FOLLOW
     return {"SIZE": n, "HALF": n * F["SQUARE_SIZE"] / 2, "GRID": F["GRID" + t], "PREPARE_DIST": F["PREPARE_DIST" + t],
             "COMMIT_DIST": F["COMMIT_DIST" + t], "HARD_COMMIT_DIST": F["HARD_COMMIT_DIST" + t],
+            "MIN_LEAD": F["MIN_LEAD" + t],
             "EDGE_MARGIN": F["EDGE_MARGIN" + t], "REACH": F["REACH" + t], "LOOKAHEAD_S": F["LOOKAHEAD_S" + t],
             "RECHECK_S": F["RECHECK_S" + t], "FAST_MODE_V": F["FAST_V" + t]}
 
@@ -182,7 +183,12 @@ def follow_centre_near(tx, ty, px, py, reach=None, size=1024):
 
 def follow_target(px, py, vx, vy, size=1024):
     t, reach, _ = follow_mode(vx, vy, size)
-    return follow_centre_near(px + vx * t, py + vy * t, px, py, reach, size)
+    lx, ly = vx * t, vy * t
+    lead, v2 = follow_table(size)["MIN_LEAD"], vx * vx + vy * vy
+    if lead > 0 and v2 > FOLLOW["MIN_LEAD_V"] ** 2 and lx * lx + ly * ly < lead * lead:
+        k = lead / math.sqrt(v2)
+        lx, ly = vx * k, vy * k
+    return follow_centre_near(px + lx, py + ly, px, py, reach, size)
 
 
 def _axis_time(p, v, c, dist):
@@ -201,6 +207,15 @@ def _retargets(px, py, vx, vy, pending, size):
     return follow_target(px, py, vx, vy, size) != (pending["cx"], pending["cy"])
 
 
+def follow_centre_ahead(px, py, vx, vy, cx, cy, size=1024):
+    """follow.centreAhead: the block's centre still ahead of a player whose target MIN_LEAD sets."""
+    T = follow_table(size)
+    lead, v2 = T["MIN_LEAD"], vx * vx + vy * vy
+    if lead <= 0 or v2 <= FOLLOW["MIN_LEAD_V"] ** 2 or v2 * T["LOOKAHEAD_S"] ** 2 >= lead * lead:
+        return False
+    return (cx - px) * vx + (cy - py) * vy > 0 and cheb(px, py, cx, cy) <= lead + T["GRID"]
+
+
 def follow_decide(px, py, vx, vy, cx, cy, pending, now=0.0, retry_at=0.0, gate=None, latency=None, size=1024):
     """follow.decide: ('prepare', tx, ty) | ('commit',) | ('discard',) | None."""
     if cx is None:
@@ -212,7 +227,8 @@ def follow_decide(px, py, vx, vy, cx, cy, pending, now=0.0, retry_at=0.0, gate=N
         pd = cheb(px, py, pending["cx"], pending["cy"])
         if pending.get("ready") and pd < d and d > T["COMMIT_DIST"]:
             r = T["RECHECK_S"]
-            if (r > 0 and ahead == 0 and d <= T["HARD_COMMIT_DIST"]
+            lead_set = T["MIN_LEAD"] > 0 and (vx * vx + vy * vy) * T["LOOKAHEAD_S"] ** 2 < T["MIN_LEAD"] ** 2
+            if (r > 0 and ahead == 0 and not lead_set and d <= T["HARD_COMMIT_DIST"]
                     and cheb(px + vx * r, py + vy * r, pending["cx"], pending["cy"]) > T["PREPARE_DIST"]
                     and follow_time_to(px, py, vx, vy, cx, cy, FOLLOW["RECHECK_SAFE"])
                     > max(FOLLOW["LATENCY_S"] if latency is None else latency, FOLLOW["LATENCY_S"])
@@ -233,6 +249,8 @@ def follow_decide(px, py, vx, vy, cx, cy, pending, now=0.0, retry_at=0.0, gate=N
             return ("discard",)
         return None
     if cheb(px + vx * ahead, py + vy * ahead, cx, cy) <= T["PREPARE_DIST"] or now < retry_at:
+        return None
+    if follow_centre_ahead(px, py, vx, vy, cx, cy, size):
         return None
     tx, ty = follow_target(px, py, vx, vy, size)
     if (tx, ty) == (cx, cy):

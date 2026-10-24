@@ -1171,9 +1171,10 @@ class DriveBase(unittest.TestCase):
         self.assertEqual(stats["prepare_anchor"], 1, "one prepare_anchor per rebase")
         # the prefetch predicts the mod's requests: each terrain is built once, and only a straight-line
         # prediction that the bend or the final stop overtook is never asked for (512 blocks' 5 s lead since
-        # 2026-10-15: a prediction further ahead, a few more of those)
+        # 2026-10-15: a prediction further ahead, a few more of those; their 256 m minimum lead since 2026-10-23: up to
+        # ~8 at this drive's bend, but 52 heightmaps built for 42 moves instead of 61 for 54)
         self.assertEqual(len(set(built)), hm_built, "a terrain was built twice")
-        self.assertLessEqual(len(unasked), 5, unasked)
+        self.assertLessEqual(len(unasked), 9 if self.block == 512 else 5, unasked)
         self.assertEqual(stats["superseded_tiles"], 0)
         self.assertFalse(far.unknown_removes, far.unknown_removes[:5])
         self.assertEqual(far.counters["unknown_swap_keys"], 0)
@@ -1187,9 +1188,10 @@ class DriveBase(unittest.TestCase):
             self.assertTrue(all(ff.tile_of(k).level == 0 for k in under))
         self.assertFalse(far.old)
         # (a)
-        # at 30 m/s a commit moves the block 512 m (follow.lua lookahead), so >= one per 600 m (512²: 128 m
-        # per commit with the 2 s lookahead, so >= one per 300 m)
-        self.assertGreaterEqual(len(follows), int(REBASE_M / (600 if size == 1024 else 300)))
+        # at 30 m/s a commit moves the block 512 m (follow.lua lookahead), so >= one per 600 m (512²: the next block
+        # at least MIN_LEAD (256 m) ahead and asked for once the player is past the centre, 2026-10-23: ~384 m per
+        # commit, so >= one per 400 m)
+        self.assertGreaterEqual(len(follows), int(REBASE_M / (600 if size == 1024 else 400)))
         # M4: the player never came within 150 m of the committed block's collidable edge
         self.assertGreaterEqual(stats["edge_min"], 150.0, stats["edge_min_at"])
         for x in follows:

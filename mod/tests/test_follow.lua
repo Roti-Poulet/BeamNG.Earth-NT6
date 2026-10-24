@@ -106,6 +106,41 @@ pend = { cx = 256, cy = 0, ready = true }
 T.check(d(192, 0, 40, 0, 0, 0, pend, 0, 0) == nil, '512: ready at 192 m: hold')
 T.check(d(193, 0, 40, 0, 0, 0, pend, 0, 0) == 'commit', '512: ready past 192 m: commit')
 T.check(d(400, 0, 40, 0, 0, 0, { cx = 0, cy = 384, ready = false }, 0, 0) == 'discard', '512: prepared block off by > 260 m: discard')
+-- town speeds: the next block at least MIN_LEAD (256 m) ahead, not one grid step (a move every 128 m, each a ~50 ms frame
+-- on a Deck); standing still: no lead
+a, cx, cy = d(129, 0, 11, 0, 0, 0, nil, 0, 0)
+T.check(a == 'prepare' and cx == 384 and cy == 0, '512 at 25 mph: prepare snap128(p + 256 m)')
+a, cx, cy = d(129, 0, 0, 0, 0, 0, nil, 0, 0)
+T.check(a == 'prepare' and cx == 128, '512 standing: the block round the player')
+-- town drives: half the moves, never nearer than 225 m to the block's edge (1 s and 4 s heightmap latency)
+do
+  local function moves(speed, hdg, lat)
+    local vx, vy = speed * math.cos(math.rad(hdg)), speed * math.sin(math.rad(hdg))
+    local px, py, cx, cy, pending, t, n, minEdge = 0, 0, 0, 0, nil, 0, 0, math.huge
+    while math.sqrt(px * px + py * py) < 5000 do
+      t = t + 1 / 30
+      px, py = px + vx / 30, py + vy / 30
+      if pending and not pending.ready and t >= pending.at then pending.ready = true end
+      local act, nx, ny = d(px, py, vx, vy, cx, cy, pending, t, 0, nil, lat)
+      if act == 'prepare' then pending = { cx = nx, cy = ny, at = t + lat }
+      elseif act == 'commit' then cx, cy, pending, n = pending.cx, pending.cy, nil, n + 1
+      elseif act == 'discard' then pending = nil end
+      local g0x, g0y, g1x, g1y = lattice.groundBox(cx, cy)
+      minEdge = math.min(minEdge, px - g0x, g1x - px, py - g0y, g1y - py)
+    end
+    return n, minEdge
+  end
+  local worstN, worstE = 0, math.huge
+  for _, hdg in ipairs({ 0, 20, 45 }) do
+    for _, v in ipairs({ 7, 11, 20, 30 }) do
+      for _, lat in ipairs({ 1.0, 4.0 }) do
+        local n, e = moves(v, hdg, lat)
+        worstN, worstE = math.max(worstN, n), math.min(worstE, e)
+      end
+    end
+  end
+  T.check(worstN <= 20 and worstE >= 225, string.format('town drives (16-67 mph): <= 20 moves in 5 km (%d), >= 225 m inside (%.0f m)', worstN, worstE))
+end
 -- 134 m/s geometry: 129 + 268 = 397 -> 384; at the commit p + 2 s v is 77 m from it: commit
 a, cx = d(129, 0, 134, 0, 0, 0, nil, 0, 0)
 T.check(a == 'prepare' and cx == 384, '134 m/s: prepare (384, 0)')

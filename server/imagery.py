@@ -28,6 +28,7 @@ Output: DDS DXT1 with a full mip chain (write_dds). Pillow 12 writes DXT1 but no
 header always says 0 mips), so every level is box-downsampled and BC1-encoded by Pillow separately
 and the levels are concatenated under our own header (DDSD_MIPMAPCOUNT, DDSCAPS_MIPMAP|COMPLEX).
 """
+import contextlib
 import io
 import logging
 import math
@@ -55,7 +56,8 @@ TILE = 256
 MAX_LAT = demmod.MAX_LAT
 EARTH_CIRC = 40075016.686          # m, equatorial circumference (Web-Mercator scale)
 R_MERC = EARTH_CIRC / (2 * math.pi)  # m, the Web-Mercator sphere
-FETCH_WORKERS = 12      # (the photo hosts allow 12 / 6 at once, 2026-10-16)
+FETCH_WORKERS = 16      # (the photo hosts allow 24 (USGS, 2026-10-23) / 6 at once; more threads here only queue)
+URGENT_WORKERS = 4      # Imagery.urgent(): its own fetch threads (netfetch gives urgent requests URGENT_CONC slots)
 MEM_TILES = 512                    # decoded 256² RGB tiles kept in memory (~100 MB)
 # Attempts, retry delays, timeouts and the "source unreachable" backoff are the host's netfetch
 # policy now: once its circuit is open, its tiles fail at once instead of each paying the attempts
@@ -347,6 +349,10 @@ class Imagery:
         self.fetcher = fetcher if fetcher is not None else netfetch.Fetcher()
         self.fetcher.register_chain("imagery", [s.url for s in self.chain])
         self.pool = ThreadPoolExecutor(min(fetch_workers, FETCH_WORKERS), thread_name_prefix="img-fetch")
+        # urgent(): the player's block's photo, fetched on threads of its own as netfetch "urgent" (ahead of the far
+        # field's demand: a teleport's first block waited 37 s behind it with EOX at its budget, GitHub #116)
+        self.urgent_pool = ThreadPoolExecutor(URGENT_WORKERS, thread_name_prefix="img-urgent")
+        self._caller = threading.local()
         self.mem_tiles = MEM_TILES if mem_tiles is None else mem_tiles
         self.leaf_on = leaf_on
         self.season_mode = season_mode
@@ -447,7 +453,7 @@ class Imagery:
             self._count(src.name + ":404")
             return None
         except netfetch.FetchError as e:
-            deferred = kind != "demand" and isinstance(e, _DEFERRED)
+            deferred = kind not in ("demand", "urgent") and isinstance(e, _DEFERRED)
             self._count(src.name + (":deferred" if deferred else ":skipped" if isinstance(e, netfetch.HostUnavailable)
                                     else ":error"))
             raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred) from None
@@ -494,7 +500,7 @@ class Imagery:
                 self._count(src.name + ":404")
                 return None
             except netfetch.FetchError as e:
-                deferred = kind != "demand" and isinstance(e, _DEFERRED)
+                deferred = kind not in ("demand", "urgent") and isinstance(e, _DEFERRED)
                 self._count(src.name + (":deferred" if deferred else ":skipped" if isinstance(e, netfetch.HostUnavailable)
                                         else ":error"))
                 raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred) from None
@@ -607,12 +613,25 @@ class Imagery:
 
     def _future(self, key, kind="demand", stale=None):
         """The fetch of key (started if needed, or when the one in flight is `stale`, a finished
-        fetch whose done callback has not run yet). Caller holds the lock."""
+        fetch whose done callback has not run yet). Caller holds the lock. An urgent one does not wait for a
+        fetch queued as another kind: it fetches on the urgent threads."""
         fut = self._inflight.get(key)
-        if fut is None or fut is stale:
-            fut = self._inflight[key] = self.pool.submit(self._load_kind, key, kind)
+        if fut is None or fut is stale or (kind == "urgent" and not getattr(fut, "urgent", False)):
+            pool = self.urgent_pool if kind == "urgent" else self.pool
+            fut = self._inflight[key] = pool.submit(self._load_kind, key, kind)
+            fut.urgent = kind == "urgent"
             fut.add_done_callback(lambda f: self._finish(key, f))
         return fut
+
+    @contextlib.contextmanager
+    def urgent(self):
+        """Within: this thread's demand fetches go as netfetch "urgent" (the block the player waits on)."""
+        prev = getattr(self._caller, "urgent", False)
+        self._caller.urgent = True
+        try:
+            yield
+        finally:
+            self._caller.urgent = prev
 
     def _result(self, key, fut, kind):
         """fut's tile; a demand caller that met a dropped prefetch fetches the tile itself (one fetch
@@ -621,7 +640,7 @@ class Imagery:
             try:
                 return fut.result()
             except ImageryError as e:
-                if not e.deferred or kind != "demand":
+                if not e.deferred or kind not in ("demand", "urgent"):
                     raise
             with self._lock:
                 fut = self._future(key, stale=fut)
@@ -629,7 +648,9 @@ class Imagery:
     def tiles(self, keys, kind="demand"):
         """{(source, z, x, y): Tile or None (404, or outside the coverage probe)}, fetched
         concurrently and deduplicated across callers. Raises ImageryError if a fetch failed.
-        kind: the netfetch kind of the requests ("background": de-shadow region fits)."""
+        kind: the netfetch kind of the requests ("background": de-shadow region fits; demand within urgent(): urgent)."""
+        if kind == "demand" and getattr(self._caller, "urgent", False):
+            kind = "urgent"
         keys = list(dict.fromkeys(keys))
         probes = {k: self._probe_key(k) for k in keys}
         known = self.tiles({p for p in probes.values() if p is not None}, kind) if any(probes.values()) else {}
@@ -657,13 +678,10 @@ class Imagery:
             raise err
         return out
 
-    def prefetch(self, frame, x0, y0, size, px):
-        """Start fetching the source tiles render(frame, x0, y0, size, px) will need, without
-        waiting: the first source of the chain, or the next one where every tile of the
-        previous source is already known to be missing (an unknown coverage probe is fetched
-        first). Errors are left for render to meet. Skips a source whose host's circuit is open
-        (render fails over past it) and stops at one whose host takes no prefetch now (policy,
-        budget, bucket below half): render fetches those on demand."""
+    def _needed(self, frame, x0, y0, size, px):
+        """The source tiles render(frame, x0, y0, size, px) may need, source by source in chain order: (k, src,
+        host, [keys]); nothing past the poles, a mosaic over MAX_MOSAIC, or a source's area ending the chain (as
+        render fails over)."""
         t = size / px
         c = np.array([0.0, 0.5, 1.0]) * size
         E, N = np.meshgrid(x0 + c, y0 + c)
@@ -688,37 +706,74 @@ class Imagery:
                 # the integration drive's far field 1729 coverage holes; tonight's game measurements all ran
                 # with this behaviour; render fetches what is missing on demand)
                 return
-            host = netfetch.host_of(src.url)
+            yield k, src, netfetch.host_of(src.url), [(src, z, tx % n, ty) for ty in range(ty0, ty1 + 1)
+                                                       for tx in range(tx0, tx1 + 1)]
+
+    def _missing(self, k, key):
+        """Is key's tile known to be missing (404, or uniform where a later source can fill it)? None: not known."""
+        if key not in self._lru:
+            return None
+        a = self._lru[key]
+        return a is None or (k < len(self.chain) - 1 and a.uniform)
+
+    def prefetch(self, frame, x0, y0, size, px, soon=False):
+        """Start fetching the source tiles render(frame, x0, y0, size, px) will need, without
+        waiting: the first source of the chain, or the next one where every tile of the
+        previous source is already known to be missing (an unknown coverage probe is fetched
+        first). Errors are left for render to meet. Skips a source whose host's circuit is open
+        (render fails over past it) and stops at one whose host takes no prefetch now (policy,
+        budget, bucket below half): render fetches those on demand. soon: the far field's next tiles, needed in
+        moments, not a guess: a host that takes no prefetch now still gets them, as demand (with a host past 80 %
+        of its daily budget the far field fetched only its 2 tiles in flight at a time: a Deck's took 231 s, GitHub
+        #116)."""
+        for k, src, host, keys in self._needed(frame, x0, y0, size, px):
             if not self.fetcher.available(host):
                 continue                    # circuit open: render fails over to the next source, warm that
             # --colormatch: their regions' seams, in the background (not under the lock: it may read a
             # field from disk); before the prefetch check, so a host that takes no prefetch right now
             # still gets the regions render will need queued (they fetch as kind "background")
             if self.colormatch is not None:
-                for ty in range(ty0, ty1 + 1):
-                    for tx in range(tx0, tx1 + 1):
-                        self.colormatch.request((src, z, tx % n, ty))
+                for key in keys:
+                    self.colormatch.request(key)
+            kind = "prefetch"
             if not self.fetcher.allow(host, "prefetch"):
-                return
+                if not soon or not self.fetcher.allow(host, "demand"):
+                    return
+                kind = "demand"
             missing = True                  # every tile of this source known to be missing
             with self._lock:
-                for ty in range(ty0, ty1 + 1):
-                    for tx in range(tx0, tx1 + 1):
-                        key = (src, z, tx % n, ty)
-                        cover = self._probe_status(key)
-                        if cover == "outside":
-                            continue
-                        if cover == "unknown":          # a probe is being fetched first
-                            missing = False
-                            continue
-                        if key in self._lru:
-                            a = self._lru[key]
-                            missing &= a is None or (k < len(self.chain) - 1 and a.uniform)
-                            continue
+                for key in keys:
+                    cover = self._probe_status(key)
+                    if cover == "outside":
+                        continue
+                    if cover == "unknown":          # a probe is being fetched first
                         missing = False
-                        self._future(key, "prefetch")
+                        continue
+                    m = self._missing(k, key)
+                    if m is not None:
+                        missing &= m
+                        continue
+                    missing = False
+                    self._future(key, kind)
             if not missing:
                 return
+
+    def fetch_needed(self, frame, x0, y0, size, px):
+        """Fetch (on demand, waiting) the source tiles render(frame, x0, y0, size, px) needs: the first source of the
+        chain, the next where every tile of the previous is missing. For a far-tile worker that met a tile not on
+        disk (its prefetch was dropped: a host at its budget, GitHub #116, or a fast drive): the tiles come here,
+        the render goes back to the worker processes (one main-process render held the far field on a Deck).
+        True when the tiles are there (or known to be missing); False on a fetch error."""
+        for k, src, host, keys in self._needed(frame, x0, y0, size, px):
+            if not self.fetcher.available(host):
+                continue
+            try:
+                got = self.tiles(keys)
+            except ImageryError:
+                return False
+            if not all(v is None or (k < len(self.chain) - 1 and v.uniform) for v in got.values()):
+                return True
+        return True
 
     def warm(self, frame, points, radius, texel_m):
         """Fetch the lazy sources' tiles ahead of the player (one background thread, nearest first): the

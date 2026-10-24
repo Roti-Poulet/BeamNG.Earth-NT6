@@ -31,6 +31,11 @@ M.TAIL_STEP_M = 25
 -- path, in its lane, minding traffic, at the legal speed; given again with every new arrows' path, when the graph was
 -- applied again (its nodes are new tables) and when the car has stood still for AUTO_STALL_S.
 M.AUTO_STALL_S = 6
+M.AUTO_NOPROGRESS_S = 30  -- the route's remaining distance not down by AUTO_PROGRESS_M in this long: the path given again
+M.AUTO_PROGRESS_M = 20    -- (a car circling at 4 mph to reach a waypoint it could not, never standing still: GitHub #180)
+M.AUTO_RECOVER_M = 150    -- no progress after the path was given again either: the car put on its own carriageway this far
+                          -- ahead along the route (wedged against a curb at a junction at 3 mph, the same drive; 40 m put it
+                          -- back before the same junction six times)
 M.GRAPH_WAIT_S = 4      -- the longest a new path waits for the car's copy of the graph (then given anyway)
 M.AUTO_AGGRESSION = 0.3
 -- Safety: the AI brakes to a stop while the world server is away (no new ground or roads: an autodrive left on through
@@ -53,6 +58,9 @@ local auto = false      -- autodrive on
 local autoPath = nil    -- the node ids last given to the AI
 local autoSerial = nil  -- the graph (navgraph applies) they were taken from
 local stillSince = nil
+local progRemaining, progAt = nil, nil   -- the remaining route distance last seen go down, and when (AUTO_NOPROGRESS_S)
+local stuckTries = 0     -- AUTO_NOPROGRESS_S spells in a row without progress
+local recoverAhead       -- (below)
 local paused = false    -- the AI holds the car (world server away)
 local vehGraph = {}     -- vehicle id -> the game's map buildSerial when its mapmgr last took the graph
 local pathWait = nil    -- os.clock() since a path waits for the car to have the graph it was planned on
@@ -84,26 +92,37 @@ function M.edgeSegments(nodes)
       local o = nodes[other]
       if a and o and o.pos and not seen[key] then
         seen[key] = true
-        segs[#segs + 1] = { a.x, a.y, o.pos.x, o.pos.y, (a.z + o.pos.z) / 2 }
+        local e = n.links[other]
+        -- the way it may be driven: 0 both, 1 from this node to the other, -1 back (a one-way edge runs from its inNode)
+        local way = 0
+        if type(e) == 'table' and e.oneWay and e.inNode ~= nil then way = (e.inNode == id) and 1 or -1 end
+        segs[#segs + 1] = { a.x, a.y, o.pos.x, o.pos.y, (a.z + o.pos.z) / 2, way }
       end
     end
   end
   return segs
 end
 
--- Pure: the distance from (px, py) to the nearest segment of segs, and that segment's z.
-function M.nearestEdge(segs, px, py)
-  local bd, bz = math.huge, 0
+-- Pure: the distance from (px, py) to the nearest segment of segs, that segment's z, and {x, y, dx, dy}: the point on it
+-- and its direction (the way it may be driven for a one-way edge). With a heading (hx, hy): only segments that may be
+-- driven that way (a one-way edge against it is left out: the other carriageway of a divided road).
+function M.nearestEdge(segs, px, py, hx, hy)
+  local bd, bz, bp = math.huge, 0, nil
   for _, s in ipairs(segs) do
     local ax, ay, bx, by = s[1], s[2], s[3], s[4]
     local dx, dy = bx - ax, by - ay
+    if hx and (s[6] or 0) ~= 0 and (dx * hx + dy * hy) * s[6] <= 0 then goto next end
     local L2 = dx * dx + dy * dy
     local t = L2 > 0 and math.max(0, math.min(1, ((px - ax) * dx + (py - ay) * dy) / L2)) or 0
     local qx, qy = ax + t * dx - px, ay + t * dy - py
     local d = qx * qx + qy * qy
-    if d < bd then bd, bz = d, s[5] end
+    if d < bd then
+      bd, bz = d, s[5]
+      bp = { x = qx + px, y = qy + py, dx = (s[6] or 0) < 0 and -dx or dx, dy = (s[6] or 0) < 0 and -dy or dy }
+    end
+    ::next::
   end
-  return math.sqrt(bd), bz
+  return math.sqrt(bd), bz, bp
 end
 
 -- Pure: the compass bearing (deg, 0 = north) from (x0, y0) to (x1, y1) in the east / north frame.
@@ -181,7 +200,8 @@ function M.status()
   return { lat = dest.lat, lon = dest.lon, name = dest.name, dist = info and info.dist, bearing = info and info.bearing,
            remaining = info and info.remaining, eta = info and info.eta, routeVersion = route and route.version or 0,
            progress = progress, planning = pendingId ~= nil, routeError = routeError, pendingId = pendingId,
-           autodrive = auto, autoNodes = autoPath and #autoPath or nil, off = info and info.off, arrows = routedTo }
+           autodrive = auto, autoNodes = autoPath and #autoPath or nil, off = info and info.off, arrows = routedTo, replans = M.noProgressReplans,
+           recoveries = M.autoRecoveries }
 end
 
 -- The planned route for the map: { version, points = {{lat, lon}...}, dist, dur } or nil.
@@ -231,9 +251,15 @@ local function routeTarget(e, nodes, i, t)
     local f = seg > 0 and (s - e.cum[k]) / seg or 0
     local x = e.x[k] + f * (e.x[k + 1] - e.x[k])
     local y = e.y[k] + f * (e.y[k + 1] - e.y[k])
-    local d, z = M.nearestEdge(segs, x, y)
+    -- on the graph: near an edge drivable the route's way. A divided road's carriageways lie closer than ON_GRAPH_M:
+    -- where the local graph ended a little sooner on the car's side, the target fell on the other one and the AI
+    -- turned round across the highway to reach it, then circled at 4 mph (GitHub #180, reproduced on US-1, 2026-10-23)
+    local d, z, bp = M.nearestEdge(segs, x, y, e.x[k + 1] - e.x[k], e.y[k + 1] - e.y[k])
     local final = s >= e.cum[n] - 1e-6
     if d <= M.ON_GRAPH_M then
+      -- the target / waypoint itself on that edge (not the route's point, which can lie nearer the other carriageway:
+      -- the game's planner went for that one, the wrong way up a one-way road, and asked for a U-turn; GitHub #180)
+      if bp and not final then x, y = bp.x, bp.y end
       best = { s = s, x = x, y = y, z = z, final = final }
       misses = 0
       if s - lastVia >= M.VIA_M then via[#via + 1] = best; lastVia = s end
@@ -516,6 +542,7 @@ function M.setAutodrive(on)
   if on == auto then return auto end
   auto = on
   autoPath, autoSerial, stillSince, paused, pathWait = nil, nil, nil, false, nil
+  progRemaining, progAt, stuckTries = nil, nil, 0
   if on then
     routedTo = nil                       -- the arrows (and the AI's path) set again at the next check
     lastCheck = -math.huge
@@ -560,6 +587,33 @@ local function autoKeep(nodes, now)
   if (autoPath and autoSerial ~= graphSerial()) or (stillSince and now - stillSince > M.AUTO_STALL_S) then
     routedTo = nil
   end
+end
+
+-- The car put back on the road AUTO_RECOVER_M ahead along route e (from segment i, fraction t): on the graph edge nearest
+-- that point that may be driven the route's way, facing that way, on the ground. Returns true when it was placed.
+recoverAhead = function(e, nodes, i, t)
+  local veh = playerVeh()
+  if not veh then return false end
+  local n = #e.x
+  local s = math.min(e.cum[i] + t * (e.cum[i + 1] - e.cum[i]) + M.AUTO_RECOVER_M, e.cum[n])
+  local k = i
+  while k < n - 1 and e.cum[k + 1] < s do k = k + 1 end
+  local seg = e.cum[k + 1] - e.cum[k]
+  local f = seg > 0 and (s - e.cum[k]) / seg or 0
+  local x, y = e.x[k] + f * (e.x[k + 1] - e.x[k]), e.y[k] + f * (e.y[k + 1] - e.y[k])
+  local d, z, bp = M.nearestEdge(M.edgeSegments(nodes), x, y, e.x[k + 1] - e.x[k], e.y[k + 1] - e.y[k])
+  if not bp or d > M.ON_GRAPH_M then return false end
+  local hl = math.sqrt(bp.dx * bp.dx + bp.dy * bp.dy)
+  if hl < 1e-6 then return false end
+  local pos = vec3(bp.x, bp.y, z + 2)
+  local ray = rawget(_G, 'castRayStatic')
+  local hit = ray and ray(pos + vec3(0, 0, 40), vec3(0, 0, -1), 100)
+  if hit and hit < 100 then pos.z = pos.z + 40 - hit + 0.5 end
+  local ok = pcall(spawn.safeTeleport, veh, pos, quatFromDir(vec3(bp.dx / hl, bp.dy / hl, 0), vec3(0, 0, 1)), nil, nil,
+    false, nil, true)
+  if ok then log('I', 'beamngEarth', string.format('autodrive: no progress, the car put on the route ahead at (%.0f, %.0f)',
+    pos.x, pos.y)) end
+  return ok
 end
 
 -- Every frame (anchor: the current geodesy anchor; player: {x, y, lat, lon}): the route kept to the destination.
@@ -611,6 +665,20 @@ function M.update(anchor, player)
     local remaining = e.cum[n] - (e.cum[i] + t * (e.cum[i + 1] - e.cum[i]))
     info.remaining = remaining + off
     info.off = off
+    if auto and not paused then
+      if not progRemaining or info.remaining < progRemaining - M.AUTO_PROGRESS_M then
+        if progRemaining then stuckTries = 0 end
+        progRemaining, progAt = info.remaining, now
+      elseif now - progAt > M.AUTO_NOPROGRESS_S then
+        stuckTries = stuckTries + 1
+        if stuckTries >= 2 then         -- the path given again did not help: onto the route ahead
+          stuckTries = 0
+          if nodes and recoverAhead(e, nodes, i, t) then M.autoRecoveries = (M.autoRecoveries or 0) + 1 end
+        end
+        routedTo, progRemaining = nil, nil          -- planned and given again at this check
+        M.noProgressReplans = (M.noProgressReplans or 0) + 1
+      end
+    end
     if route.dist and route.dist > 0 and route.dur then info.eta = route.dur * remaining / route.dist end
     if off > M.OFF_ROUTE_M and not pendingId and now - lastRequest > M.REROUTE_S then requestRoute(player) end
     local tg = nodes and routeTarget(e, nodes, i, t)

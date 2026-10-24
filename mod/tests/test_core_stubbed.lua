@@ -279,6 +279,11 @@ local clusterMoves = calls.setClusterPosRelRot
 veh.pos = vec3(290, 0, 1200)
 frames(5)
 T.check(#received('prepare_terrain') == 0, 'below 300 m: no terrain request')
+local velWas = veh.vel
+veh.pos, veh.vel = vec3(305, 0, 1200), vec3(0 / 0, 0 / 0, 0)    -- an unstable car (NaN), before the game resets it
+frames(5)
+T.check(#received('prepare_terrain') == 0, 'a NaN speed: no terrain request')
+veh.pos, veh.vel = vec3(290, 0, 1200), velWas
 veh.pos = vec3(301, 0, 1200)
 T.check(pumpUntil(function() return #received('prepare_terrain') == 1 end, 5), 'prepare_terrain past 300 m')
 local pt = received('prepare_terrain')[1]
@@ -619,7 +624,7 @@ T.check(pumpUntil(function() return #received('prepare_anchor') == nA + 1 end, 1
 T.check(lattice.N == 512 and lattice.HALF == 512 and follow.GRID == 128 and follow.REACH == 260 and follow.PREPARE_DIST == 128
   and rebase.STALE_DIST == 192, 'hello.blockSize 512: lattice, follow table and staleness rule switched')
 local rq = last('prepare_anchor')
-T.check(rq.cx % 128 == 0 and rq.cy % 128 == 0 and math.abs(rq.cx - veh.pos.x) <= 64, 'resync hint on the 128 m grid')
+T.check(rq.cx % 128 == 0 and rq.cy % 128 == 0 and math.abs(rq.cx - veh.pos.x) <= follow.MIN_LEAD + 64, 'resync hint on the 128 m grid (at most MIN_LEAD ahead)')
 local imp512 = calls.importMaps
 serverSend({ type = 'anchor_ready', requestId = rq.requestId, anchorId = 7, lat = rq.lat, lon = rq.lon, groundZ = 0,
   terrain = { cx = rq.cx, cy = rq.cy, heightmap = '/temp/beamngEarth/s5/hm_7.png', size = 512, squareSize = SQ,
@@ -633,7 +638,7 @@ veh.pos = vec3(rq.cx + 140, rq.cy, 1200)
 veh.vel = vec3(30, 0, 0)
 T.check(pumpUntil(function() return last('prepare_terrain').anchorId == 7 end, 10), '512: terrain-follow prepares past 128 m')
 local pt7 = last('prepare_terrain')
-T.check(pt7.cx == rq.cx + 256 and pt7.cy == rq.cy, '512: target snap128(p + 2 s v) = cx + 256')
+T.check(pt7.cx == rq.cx + 384 and pt7.cy == rq.cy, '512: target snap128(p + max(5 s v, MIN_LEAD)) = cx + 384')
 serverSend({ type = 'terrain_ready', requestId = pt7.requestId, anchorId = 7, cx = pt7.cx, cy = pt7.cy,
   heightmap = '/temp/beamngEarth/s5/hm_7b.png', size = 1024, squareSize = SQ, zBase = 1120, maxHeight = 1024, q = 1 / 64 })
 local statusLog = {}

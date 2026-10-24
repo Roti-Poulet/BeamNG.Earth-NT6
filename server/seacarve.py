@@ -29,6 +29,7 @@ from polygon import Path
 
 import mapcells
 import pacer
+import cache as cachemod
 import staging
 
 log = logging.getLogger("earthd.seacarve")
@@ -47,6 +48,8 @@ BATHY_DOWN = 4              # ~7.5 m pixels
 BATHY_MIN, BATHY_MAX = 1.0, 80.0    # m: a sea floor this deep at least / at most
 BATHY_RETRY_S = 120.0       # s: a cell built without bathymetry is built again after this (in memory)
 SHORE_SLOPE = 0.3           # m/m: with bathymetry, the floor reaches its depth from the shore this steeply
+RAW_MB = 1536               # the uncompressed rasters (memory-mapped; ~9.5 MB a cell) kept at most (earthd's start-up
+                            # prune: they grew to 13.7 GB on a Steam Deck beside 0.15 GB of the compressed ones they repeat)
 PX_ZOOM = 16                # raster pixels: Web-Mercator z16 (256 px tiles): 1024 px per z14 cell
 CELL_PX = 256 << (PX_ZOOM - mapcells.ZOOM)      # raster pixels per cell edge (1024)
 PAD_PX = 32                 # margin rasterised from the neighbouring cells (> the cap's distance)
@@ -161,20 +164,10 @@ def _px_m(lat):
 def shore_steps(water, kmax):
     """For each True pixel, the number of erosion steps (alternating 4- and 8-neighbour, an octagonal
     approximation of the euclidean distance) until it is reached from a False pixel, capped at kmax;
-    0 on False pixels."""
-    out = np.zeros(water.shape, np.int16)
-    cur = water.copy()
-    for k in range(1, kmax + 1):
-        if not cur.any():
-            break
-        p = np.pad(cur, 1, constant_values=True)    # outside the raster: as its edge (padded margin)
-        nxt = cur & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
-        if k % 2 == 0:
-            nxt &= p[:-2, :-2] & p[:-2, 2:] & p[2:, :-2] & p[2:, 2:]
-        out[cur & ~nxt] = k
-        cur = nxt
-    out[cur] = kmax
-    return out
+    0 on False pixels (outside the raster counts as water: the padded margin). Rust (earthfast.shore_steps)."""
+    import fast
+    fast.require(67, "shore_steps")
+    return fast._ef.shore_steps(np.ascontiguousarray(water, bool), int(kmax))
 
 
 def _touches(m, other, k):
@@ -320,7 +313,9 @@ class SeaCarver:
         raw = _raw_path(p)
         if raw and os.path.exists(raw):
             try:
-                return _open_raw(raw), True
+                got = _open_raw(raw)
+                cachemod.touch_once(raw)        # (recent for the start-up prune: cache.prune_dir, RAW_MB)
+                return got, True
             except (OSError, ValueError) as e:      # (a damaged file: the npz, or a build, again)
                 log.debug("sea: %s: %s", raw, e)
         if p and os.path.exists(p):
@@ -599,31 +594,13 @@ class SeaCarver:
         hw = w / 2 / px
         D = np.clip(w / 6.0, *LINE_DEPTH_M)
         bank = LINE_BANK_M / px
-        for k in range(len(q) - 1):
-            a, b = q[k], q[k + 1]
-            reach = max(hw[k], hw[k + 1]) + bank
-            i0, i1 = max(0, int(min(a[0], b[0]) - reach)), min(n, int(max(a[0], b[0]) + reach) + 2)
-            j0, j1 = max(0, int(min(a[1], b[1]) - reach)), min(n, int(max(a[1], b[1]) + reach) + 2)
-            if i1 <= i0 or j1 <= j0:
-                continue
-            gi, gj = np.meshgrid(np.arange(i0, i1) + 0.5, np.arange(j0, j1) + 0.5)
-            ab = b - a
-            L2 = float(ab @ ab) or 1e-9
-            tt = np.clip(((gi - a[0]) * ab[0] + (gj - a[1]) * ab[1]) / L2, 0.0, 1.0)
-            dist = np.hypot(gi - (a[0] + tt * ab[0]), gj - (a[1] + tt * ab[1]))
-            h = hw[k] + (hw[k + 1] - hw[k]) * tt
-            L = lv[k] + (lv[k + 1] - lv[k]) * tt
-            dd = D[k] + (D[k + 1] - D[k]) * tt
-            inside = dist <= h
-            want = np.where(inside, dd * (1 - (dist / np.maximum(h, 1e-6)) ** 2),
-                            -(dist - h) * px * LINE_BANK_SLOPE)
-            m = (dist <= h + bank) & ~held[j0:j1, i0:i1]
-            cur_d, cur_l = depth[j0:j1, i0:i1], level[j0:j1, i0:i1]
-            # the deeper cut wins where lines meet (a confluence); a pixel not cut yet takes this one
-            take = m & (np.isnan(cur_l) | (L - want < cur_l - cur_d))
-            cur_d[take] = want[take]
-            cur_l[take] = L[take]
-            drawn[j0:j1, i0:i1] |= take & inside
+        # each segment's box of pixels: the bed inside the half width, the bank beyond it; the deeper cut wins where
+        # lines meet (a confluence), a pixel not cut yet takes this one (Rust: earthfast.carve_segments)
+        import fast
+        fast.require(67, "carve_segments")
+        fast._ef.carve_segments(np.ascontiguousarray(q, np.float64), np.asarray(hw, np.float64),
+                                np.asarray(lv, np.float64), np.asarray(D, np.float64), float(bank), float(px),
+                                float(LINE_BANK_SLOPE), held, depth, level, drawn)
 
     def _coarse_dem(self, m, ox, oy):
         """The DEM every RIVER_DEM_STEP pixels over m's bounding box: (grid, j0, i0), None without one."""

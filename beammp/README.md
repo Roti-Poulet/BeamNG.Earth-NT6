@@ -43,5 +43,7 @@ data and little CPU: the world is built on each player's computer.
 - Players near each other share one world origin and split the work of building the world: each piece of the distant
   landscape is built once and sent to the others. For that, the other players must reach each player's computer on
   **TCP port 47621** (on one network it just works; over the internet, each player forwards it, or else simply builds
-  everything themselves). A player can pick another port with the environment variable `BNGE_SHARE_PORT`.
+  everything themselves). To use another port on your server, edit the line `G.SHARE_PORT = 47621` near the top of
+  `Resources/Server/BeamNGEarth/main.lua` and restart the server: every player who joins gets it. A player can still
+  pick their own with the environment variable `BNGE_SHARE_PORT`.
 - Players far apart (another country) each build their own world and don't see each other's cars until they meet.

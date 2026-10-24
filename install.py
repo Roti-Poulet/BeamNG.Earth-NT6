@@ -4,7 +4,7 @@
 What it does:
   1. finds your BeamNG.drive user folder (or takes --user-dir),
   2. copies the mod (mod/beamng_earth/) to <user folder>/mods/unpacked/beamng_earth,
-  3. makes a Python virtual environment in .venv and installs the server's packages into it,
+  3. installs the server's packages into the bundled Python on Windows, or a .venv on Linux,
   4. remembers the user folder in .beamng_earth.json for start.py and the run_server launchers.
 
 Run it again at any time: it only changes what is out of date.
@@ -31,7 +31,7 @@ MOD_NAME = "beamng_earth"
 VENV = os.path.join(ROOT, ".venv")
 REQUIREMENTS = os.path.join(ROOT, "server", "requirements.txt")
 CONFIG = os.path.join(ROOT, ".beamng_earth.json")
-REQ_STAMP = os.path.join(ROOT, ".requirements.sha256")      # no venv any more: the packages go into PYTHON_EXE
+REQ_STAMP = os.path.join(ROOT, ".requirements.sha256")  # start.py uses this stamp on Windows and Linux
 STEAM_APP_ID = "284160"
 MIN_PY = (3, 10)
 IS_WIN = os.name == "nt"
@@ -225,8 +225,9 @@ def ensure_mod_active(user_dir):
 
 
 def install_mod(user_dir, assume_yes, dry_run, quiet=False):
-    """Copy the mod into the user folder. Returns 'current', 'updated', 'installed', 'kept' or None (dry run);
-    quiet: no messages but the notes (the launcher prints one status line)."""
+    """Copy the mod into the user folder. Returns 'current', 'enabled' (current, but it had been turned off in the
+    game's mod list), 'updated', 'installed', 'kept' or None (dry run); quiet: no messages but the notes (the launcher
+    prints one status line)."""
     def note(msg):
         if not quiet:
             say(msg)
@@ -236,18 +237,20 @@ def install_mod(user_dir, assume_yes, dry_run, quiet=False):
     packed = os.path.join(user_dir, "mods", MOD_NAME + ".zip")
     if os.path.isfile(packed):
         say(f"Note: there is also a zipped copy at {packed}; remove it so the game does not load two versions.")
-    if not dry_run and ensure_mod_active(user_dir):
+    enabled = not dry_run and ensure_mod_active(user_dir)
+    if enabled:
         say("Mod: it had been turned off in the game's mod list (a BeamMP server does that); turned it back on.")
     if os.path.isdir(dest):
         if tree_hash(dest) == tree_hash(MOD_SRC):
             note(f"Mod: already up to date in {dest}")
-            return "current"
+            return "enabled" if enabled else "current"
         if not (assume_yes and quiet) and not ask(f"Mod: an older copy is installed in {dest}. Replace it?", assume_yes):
             note("Mod: kept the installed copy (it may not match this server version).")
             return "kept"
         if dry_run:
             say(f"(dry run) would replace {dest}")
             return None
+        old_times = _unchanged_times(dest, MOD_SRC)
         shutil.rmtree(dest)
         status = "updated"
     elif dry_run:
@@ -257,8 +260,167 @@ def install_mod(user_dir, assume_yes, dry_run, quiet=False):
         status = "installed"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.copytree(MOD_SRC, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
+    if status == "updated":
+        _stamp_times(dest, old_times)
     note(f"Mod: installed to {dest}")
     return status
+
+
+# The game packs a terrain material's textures into its own cache (temp/art/terrainMaterialCache) and packs them again,
+# 1.5-3 s each on its main thread, whenever a source file is newer than its cache entry ("cache outdated" in its log).
+# An update copied every file with the build's times (a fresh checkout's: new), so the first session after each one
+# repacked every ground material as it first appeared: freezes of ~2.7 s driving into new ground (the user,
+# 2026-10-21: "freezes" in Pécs and Brisbane on 1.5.4, 13 repacks in the game's log). An unchanged file keeps the
+# time of the copy it replaces; a changed one gets now, newer than any cache entry made from its old content.
+def _unchanged_times(dest, src):
+    """{relative path: (atime, mtime)} of the files in dest whose content is the same in src."""
+    import filecmp
+    out = {}
+    for dirpath, _, filenames in os.walk(dest):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, dest)
+            other = os.path.join(src, rel)
+            try:
+                if os.path.isfile(other) and filecmp.cmp(full, other, shallow=False):
+                    st = os.stat(full)
+                    out[rel] = (st.st_atime, st.st_mtime)
+            except OSError:
+                pass
+    return out
+
+
+def _stamp_times(dest, old_times):
+    """The installed files' times: an unchanged file's (old_times) as before, the others now."""
+    for dirpath, _, filenames in os.walk(dest):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                os.utime(full, old_times.get(os.path.relpath(full, dest)))
+            except OSError:
+                pass
+
+
+# --- a game already running: its Lua reloaded so it mounts the mod ------------------------------
+
+# A game started before the app (by the BeamMP launcher, or by hand) read its mod list when it started: a mod installed,
+# updated or turned back on since would load only on its next start (the user, 2026-10-23: "If the game is already
+# running and you launch the .earth server. Force the game to reload so it loads the mod properly"). The game takes
+# beamng: commands on a named pipe (BinLinux/BeamNG_scheme_handler.sh writes them there; Windows: the same name under
+# \\.\pipe\), and one fires its Reload Lua action (Ctrl+L): a Lua reload reads the mod list again and mounts what is on.
+# A level open through the reload is left behind the main menu (freeroam's state gone), so a one-shot script in the user
+# folder (every modScript.lua runs when the mod list is read) starts it again and removes itself.
+GAME_PIPE = r"\\.\pipe\BEAMNGCOMMANDLISTENER" if IS_WIN else "/tmp/BEAMNGCOMMANDLISTENER"
+RELOAD_COMMAND = b"v1/core_input_actions/triggerDownUp/lua_reload"
+RELOADED_FILES = {
+    "scripts/beamng_earth_reload/modScript.lua": """\
+-- Written by the BeamNG.Earth app, which asked the running game to reload its Lua (to mount the mod): loads
+-- beamngEarthReloaded once after that reload (it removes both files).
+setExtensionUnloadMode('beamngEarthReloaded', 'manual')
+""",
+    "lua/ge/extensions/beamngEarthReloaded.lua": """\
+-- Written by the BeamNG.Earth app; runs once after the Lua reload it asked for (the game was already running when the
+-- app started, so it had read its mod list without the mod). A freeroam level open through the reload is left behind
+-- the main menu with freeroam's state gone: it is started again. Then this file and its modScript are removed.
+local M = {}
+local frames, since, missionId, nudged, inAt, hides = 0, nil, nil, false, nil, 0
+local HIDE_AT = { 3, 8, 15, 25, 40 }      -- s after the level is in
+
+local function done()
+  FS:removeFile('/lua/ge/extensions/beamngEarthReloaded.lua')
+  FS:removeFile('/scripts/beamng_earth_reload/modScript.lua')
+  FS:directoryRemove('/scripts/beamng_earth_reload')
+  extensions.unload('beamngEarthReloaded')
+end
+
+function M.onUpdate(dtReal)
+  frames = frames + 1
+  if since then
+    -- the restart: the UI is itself starting again after the reload and can miss the loading screen's messages
+    since = since + math.min(dtReal or 0, 0.25)
+    if not nudged and since > 2 and scenetree.MissionGroup and scenetree.MissionGroup:getId() == missionId then
+      nudged = true                       -- the old level still there: the UI never confirmed the loading screen
+      core_gamestate.loadingScreenActive()
+    end
+    if freeroam_freeroam.state.freeroamActive and not core_gamestate.loading() then
+      -- the level in: its loading screen hidden again, a few times (a UI still starting misses the hides before it is
+      -- up, ~10 s on a Steam Deck; one more when it is already hidden changes nothing)
+      inAt = inAt or since
+      if hides < #HIDE_AT and since - inAt > HIDE_AT[hides + 1] then
+        hides = hides + 1
+        guihooks.trigger('LoadingScreen', { active = false, gotoMainMenu = false, gameState = core_gamestate.state })
+        if hides == #HIDE_AT then done() end
+      end
+    end
+    if since > 180 then done() end
+    return
+  end
+  if frames < 10 or not (core_modmanager and core_modmanager.isReady()) then return end
+  local mission = getMissionFilename() or ''
+  local level = mission:match('^/?(levels/[^/]+/)')
+  local freeroamOn = freeroam_freeroam and freeroam_freeroam.state and freeroam_freeroam.state.freeroamActive
+  local career = career_career and career_career.isActive and career_career.isActive()
+  log('I', 'beamngEarth', 'Lua reloaded by the BeamNG.Earth app to mount the mod (level: ' .. (level or 'none') .. ')')
+  if level and scenetree.MissionGroup and not freeroamOn and not career and freeroam_freeroam then
+    missionId = scenetree.MissionGroup:getId()
+    since = 0
+    freeroam_freeroam.startFreeroam(level)
+    return
+  end
+  done()
+end
+
+return M
+""",
+}
+
+
+def _reload_files(user_dir):
+    return [os.path.join(user_dir, *rel.split("/")) for rel in RELOADED_FILES]
+
+
+def clear_reload_files(user_dir):
+    """The one-shot reload script removed (left over from a reload that did not happen)."""
+    for path in _reload_files(user_dir):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(os.path.dirname(_reload_files(user_dir)[0]))
+    except OSError:
+        pass
+
+
+def send_game_command(command):
+    """A beamng: command (without 'beamng:') to the running game through its pipe. False if no game takes it (none
+    running; the Windows build under Proton, whose pipe is inside Wine; a sandbox with its own /tmp)."""
+    try:
+        if IS_WIN:
+            with open(GAME_PIPE, "wb", buffering=0) as f:
+                f.write(command)
+            return True
+        # (non-blocking: a pipe left by a game that is gone has no reader, and the open fails instead of waiting)
+        fd = os.open(GAME_PIPE, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            return os.write(fd, command) == len(command)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def reload_running_game(user_dir):
+    """The running game's Lua reloaded, so it mounts the mod as it is now; an open freeroam level is started again.
+    False if the game could not be reached."""
+    for path, text in zip(_reload_files(user_dir), RELOADED_FILES.values()):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    if send_game_command(RELOAD_COMMAND):
+        return True
+    clear_reload_files(user_dir)
+    return False
 
 
 # --- the server's Python environment ------------------------------------------------------------
@@ -310,12 +472,10 @@ def setup_venv(dry_run):
         hint = "  Check your internet connection (and proxy/firewall), then run install.py again."
         if IS_WIN:
             hint = ("  For connection errors, check your internet connection (and proxy/firewall), then retry."
-                    "\n  If pip reports 'No matching distribution found' for duckdb, no prebuilt package is available"
-                    "\n  for this Python/platform. Try 64-bit Python 3.12 (used by the packaged release builds)."
-                    "\n  Close the server, rename this folder's .venv to an unused backup name, then run:"
-                    "\n    py -3.12 install.py"
-                    "\n  Installing another Python alone does not replace an existing .venv."
-                    "\n  Or use the standalone Windows .exe from the GitHub Releases page.")
+                    "\n  If pip reports 'No matching distribution found' for duckdb, the bundled Python version"
+                    "\n  may not have a compatible prebuilt package for this Windows version/architecture."
+                    "\n  Check the embedded Python in the 'python' folder and use a compatible package/Python build."
+                    "\n  The mod is installed already; only the server's packages are missing.")
         fail("pip could not install the packages (see the messages above).\n"
              + hint + "\n"
              "  The mod is installed already; only the server's packages are missing.")
@@ -352,18 +512,19 @@ def load_config():
 
 def main():
     ap = argparse.ArgumentParser(description=f"Install BeamNG.Earth {version()}: the mod into BeamNG.drive and "
-                                             "the companion server's Python packages into .venv.")
+                                             "the companion server's packages into bundled Python (Windows) or .venv (Linux).")
     ap.add_argument("--user-dir", help="BeamNG.drive user folder (default: found automatically)")
     ap.add_argument("--yes", "-y", action="store_true", help="answer yes to every question (replace an older mod copy, "
                                                              "pick the first user folder found)")
-    ap.add_argument("--no-venv", action="store_true", help="only install the mod; skip the Python environment")
+    ap.add_argument("--no-venv", action="store_true", help="only install the mod; skip Python package installation")
     ap.add_argument("--dry-run", action="store_true", help="show what would be done without changing anything")
     args = ap.parse_args()
 
     if sys.version_info < MIN_PY:
         fail(f"Python {MIN_PY[0]}.{MIN_PY[1]} or newer is needed (this is {sys.version.split()[0]}). "
              "Get it from https://www.python.org/downloads/")
-    check_python()
+    if not args.no_venv:
+        check_python()
     say(f"BeamNG.Earth {version()} installer")
     say("")
     user_dir = choose_user_dir(args)

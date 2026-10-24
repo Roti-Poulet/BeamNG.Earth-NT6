@@ -211,8 +211,13 @@ class OsmTags:
             box = (f"bbox.xmin <= {lon1!r} AND bbox.xmax >= {lon0!r} AND bbox.ymin <= {lat1!r} "
                    f"AND bbox.ymax >= {lat0!r}")
             cols = ", ".join(f"{expr} AS \"{name}\"" for name, expr in COLUMNS.items())
+            # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
+            # here, and building a dict per way of every highway in the cell was most of this thread's CPU
+            # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
+            some = " OR ".join(f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"}))
             rows = con.execute(f"""SELECT id, highway = 'raceway', file_row_number, {cols}
-                FROM read_parquet({uri}, file_row_number = true) WHERE ({only}) AND {box}""").fetchall()
+                FROM read_parquet({uri}, file_row_number = true)
+                WHERE ({only}) AND {box} AND (highway = 'raceway' OR {some})""").fetchall()
             race = [r[2] for r in rows if r[1]]
             got = []
             if race:            # (rare: the raceways' own columns and geometry, of their row groups only)

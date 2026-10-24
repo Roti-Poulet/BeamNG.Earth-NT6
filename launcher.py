@@ -885,12 +885,15 @@ def run(args):
     row("Game folder", user_dir + ("  (the Windows build, Proton)" if build == "proton" else "")
         + (f"  (Steam compatibility tool: {tool})" if tool else ""))       # (which was read: GitHub #56)
     running = game_alive()
+    if not running:
+        install.clear_reload_files(user_dir)
+    reload_game = False
     if not args.keep_mod:
         status = install.install_mod(user_dir, True, dry_run=False, quiet=True)
-        row("Mod", {"current": "up to date", "updated": "updated", "installed": "installed",
-                    "kept": "kept the installed copy"}.get(status, status or "")
-            + ("  (the game is running: it loads the new copy on its next start)"
-               if running and status in ("updated", "installed") else ""))
+        # the game read its mod list without this copy: its Lua is reloaded once the server runs (install.py)
+        reload_game = running and status in ("updated", "installed", "enabled")
+        row("Mod", {"current": "up to date", "enabled": "turned back on", "updated": "updated",
+                    "installed": "installed", "kept": "kept the installed copy"}.get(status, status or ""))
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
     if "--port" not in extra and server_port_busy():
         problem(f"another BeamNG.Earth world server is already running (port {SERVER_PORT} is in use), maybe "
@@ -909,7 +912,12 @@ def run(args):
             return
         watch_game_log(user_dir, time.time() - 5)
         if running:
-            row("Game", "already running")
+            if not reload_game:
+                row("Game", "already running")
+            elif install.reload_running_game(user_dir):
+                row("Game", "already running: reloaded its Lua so it loads the mod")
+            else:
+                row("Game", "already running: it loads the mod on its next start")
             proc = None
         else:
             if wine:

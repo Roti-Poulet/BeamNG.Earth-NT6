@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,6 +32,7 @@ import maprasters  # noqa: E402
 import netfetch  # noqa: E402
 import overture  # noqa: E402
 import rangeread  # noqa: E402
+import xproc  # noqa: E402
 
 try:
     import duckdb  # noqa: F401 (only whether it is installed)
@@ -417,6 +419,40 @@ class RangeTest(SmallBlocks, unittest.TestCase):
         self.assertEqual(out, [self.data[:4096]] * 4)
         self.assertEqual(self.t.count(), 1)
 
+    def test_one_fetch_per_block_across_processes(self):
+        # two RemoteFiles over one folder are what two of the server's processes have (each its own thread
+        # dedupe): the second waits for the first's fetch (xproc) instead of asking again
+        gate = threading.Event()
+        inner = self.t.request
+
+        def slow(url, headers, timeout):
+            gate.wait(2)
+            return inner(url, headers, timeout)
+        self.t.request = slow
+        a, b = self.remote(), self.remote()
+        out = {}
+        ta = threading.Thread(target=lambda: out.setdefault("a", a.read(0, 4096)))
+        ta.start()
+        time.sleep(0.2)                     # (a holds the blocks' locks, waiting for its answer)
+        tb = threading.Thread(target=lambda: out.setdefault("b", b.read(0, 4096)))
+        tb.start()
+        time.sleep(0.2)
+        gate.set()
+        ta.join()
+        tb.join()
+        self.assertEqual(out, {"a": self.data[:4096], "b": self.data[:4096]})
+        self.assertEqual(self.t.count(), 1)
+        self.assertEqual([n for n in os.listdir(os.path.join(self.tmp, "f")) if n.endswith(".lock")], [])
+
+    def test_a_less_urgent_fetch_is_not_waited_for(self):
+        # another process prefetching a block holds its lock: a demand read does not wait behind it
+        lock = os.path.join(self.tmp, "f", "0.blk.lock")
+        self.assertTrue(xproc.take(lock, "prefetch"))
+        t0 = time.monotonic()
+        self.assertEqual(self.remote().read(0, 100), self.data[:100])
+        self.assertLess(time.monotonic() - t0, 1.0)
+        xproc.release(lock)
+
     def test_no_second_fetch_after_a_lost_race(self):
         """A reader whose cache look missed while another thread fetched, stored and released the block
         (in-flight entry gone) finds it on its second look instead of fetching it again (seen once in
@@ -750,6 +786,43 @@ class CacheTest(Sources, SmallBlocks, unittest.TestCase):
         self.assertEqual(md3.cell(mf.CELL).digest(), cd.digest())
         with self.assertRaises(netfetch.Offline):
             md3.cell(mapcells.cell_of(10.0, 10.0), ("landcover",))
+
+    def test_a_deferred_osm_prefetch_is_not_cached(self):
+        # the OSM tags' host had no room for a prefetch: the roads are not built (prefetch False) rather than cached for
+        # good without their tags; on demand they are built without them
+        import osmtags
+        cache = os.path.join(self.tmp, "cache")
+        md, _ = self.mapdata(cache=cache)
+        with mock.patch.object(osmtags.OsmTags, "cell", side_effect=netfetch.Deferred("busy, prefetch dropped")):
+            self.assertFalse(md.prefetch(mf.CELL, ("roads",)))
+            self.assertFalse(md.has(mf.CELL, "roads"), "nothing cached")
+            self.assertIn("roads", md.cell(mf.CELL, ("roads",)).layers)
+        self.assertTrue(md.has(mf.CELL, "roads"))
+
+    def test_one_build_per_cell_across_processes(self):
+        # two MapData over one cache (two of the server's processes): the second waits for the first's layer file
+        # instead of building (downloading, decoding) the same cell again
+        cache = os.path.join(self.tmp, "cache")
+        md, _ = self.mapdata(cache=cache)
+        md2, _ = self.mapdata(cache=cache)
+        builds = []
+        real = mapdata.MapData._build
+
+        def slow(self_, key, layer, kind):
+            builds.append(layer)
+            time.sleep(0.3)
+            return real(self_, key, layer, kind)
+        out = {}
+        with mock.patch.object(mapdata.MapData, "_build", slow):
+            ta = threading.Thread(target=lambda: out.setdefault("a", md.cell(mf.CELL, ("roads",)).digest()))
+            ta.start()
+            time.sleep(0.1)
+            tb = threading.Thread(target=lambda: out.setdefault("b", md2.cell(mf.CELL, ("roads",)).digest()))
+            tb.start()
+            ta.join()
+            tb.join()
+        self.assertEqual(builds, ["roads"])
+        self.assertEqual(out["a"], out["b"])
 
     def test_mirror_shared_and_kept_fresh(self):
         """The uncompressed mirror: a second process reads the layers memory-mapped (the same digest, `en` included),

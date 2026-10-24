@@ -57,7 +57,13 @@ log = logging.getLogger("earthd.net")
 SERVER_VERSION = "0.4.0"
 PROJECT_URL = "https://github.com/TecnaGamer/BeamNG.Earth"
 USER_AGENT = f"BeamNG.Earth/{SERVER_VERSION} (+{PROJECT_URL})"
-KINDS = ("demand", "prefetch", "background", "predownload")
+KINDS = ("demand", "prefetch", "background", "predownload", "urgent")
+# "urgent": demand that goes first (the block the player waits on: its base photo). Demand takes a token only while
+# URGENT_TOKENS more stay in the bucket and leaves URGENT_CONC request slots of its own to urgent, so with a host at
+# its rate (a daily budget at half rate: GitHub #116, a teleport's first block waited 37 s behind the far field's
+# hundreds of tile requests) the player's block still gets its tiles at once.
+URGENT_TOKENS = 2.0
+URGENT_CONC = 2
 PREFETCH_RESERVE = 0.5          # prefetch takes a token only while the bucket holds more than this x burst
 BACKGROUND_RESERVE = 0.75       # background (de-shadow, weather) only above this: it comes after prefetch
 RETRY_AFTER_MIN, RETRY_AFTER_MAX = 1.0, 900.0
@@ -67,6 +73,23 @@ STATS_FLUSH_S = 60.0
 DAY = 86400.0
 TOKEN_EPS = 1e-4                # a token short by rounding (clock resolution) counts as a token
 OFFLINE_TEXT = "Offline - using cached data"
+
+NETLOG = os.environ.get("BNGE_NETLOG")      # debugging: every network request, one line each, from every process
+
+
+def _netlog(url, headers, status, body):
+    """Append "<unix time> <pid> <status> <bytes> <url> <range>" to the BNGE_NETLOG file (one write per line:
+    whole lines from every process)."""
+    line = (f"{time.time():.3f} {os.getpid()} {status} {len(body or b'')} {url} "
+            f"{(headers or {}).get('Range', '-')}\n")
+    try:
+        fd = os.open(NETLOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -106,7 +129,9 @@ TILE_HOST = dict(redirect_limited=True, binary=True)
 # docs/research/2026-10-10-rate-limits.md §5.2, the hosts the server contacts today (rates per player).
 POLICIES = {
     # (2026-10-16, the user: raise them, lower again on trouble; a first visit's far field waited ~100 s on 15/s)
-    "basemap.nationalmap.gov": HostPolicy(rate=50.0, burst=150.0, max_conc=12, daily_budget=150000,
+    # (2026-10-23, the user: raise it again: 24 at once; a PC already got ~26/s with 12 and the same far field with 24,
+    # all answered, so it helps players far from USGS, whose every request waits longer)
+    "basemap.nationalmap.gov": HostPolicy(rate=50.0, burst=150.0, max_conc=24, daily_budget=150000,
                                           allow_prefetch=True, offline_ok=True, miss_ttl=90 * DAY, **TILE_HOST),
     # NAIP through USGS's ArcGIS exportImage (imagery.py "naip"): one 1024² image a request, 4-10 s each
     # and 5xx under parallel requests (docs/research/2026-10-10-us-state-imagery.md, in-game 2026-10-13):
@@ -328,22 +353,25 @@ class TokenBucket:
             self._refill(self.clock())
             return self.tokens
 
-    def _wait(self, now):
-        """Seconds until one token is available (lock held)."""
+    def _wait(self, now, floor=0.0):
+        """Seconds until one token (and floor more) is available (lock held)."""
         self._refill(now)
+        need = 1.0 + floor
         if self.paused_until is not None:
-            return self.paused_until - now + max(0.0, 1.0 - self.tokens) / self.rate
-        return 0.0 if self.tokens >= 1.0 - TOKEN_EPS else (1.0 - self.tokens) / self.rate
+            return self.paused_until - now + max(0.0, need - self.tokens) / self.rate
+        return 0.0 if self.tokens >= need - TOKEN_EPS else (need - self.tokens) / self.rate
 
-    def take(self, timeout=None):
+    def take(self, timeout=None, floor=0.0):
         """Take one token, sleeping until there is one; False (nothing taken) if that would take
         longer than timeout seconds, or the bucket is paused (a Retry-After, also while waiting: the
-        host's breaker is open for as long, so the caller fails over instead of sleeping it out)."""
+        host's breaker is open for as long, so the caller fails over instead of sleeping it out). floor: tokens that
+        must stay in the bucket (demand leaves URGENT_TOKENS to urgent requests)."""
+        floor = min(float(floor), max(0.0, self.burst - 1.0))
         deadline = None if timeout is None else self.clock() + timeout
         while True:
             with self.lock:
                 now = self.clock()
-                wait = self._wait(now)
+                wait = self._wait(now, floor)
                 if self.paused_until is not None:
                     return False
                 if wait <= 0.0:
@@ -513,6 +541,7 @@ class Host:
         self.name, self.policy = name, policy
         self.bucket = TokenBucket(policy.rate, policy.burst, clock, sleep)
         self.sem = threading.BoundedSemaphore(max(1, policy.max_conc))
+        self.urgent_sem = threading.BoundedSemaphore(URGENT_CONC)  # (urgent requests' own slots, then the shared ones)
         self.breaker = CircuitBreaker(policy.breaker_threshold, policy.breaker_window, policy.breaker_open,
                                       policy.breaker_max, clock)
         self.day = dict.fromkeys(COUNTERS, 0)       # this UTC day (persisted)
@@ -621,7 +650,7 @@ class Fetcher:
             h.warned = now
             log.warning("net: %s: %d requests today, %d %% of the daily budget of %d: no more prefetch",
                         h.name, used, round(100 * BUDGET_WARN), p.daily_budget)
-        if kind != "demand" and used >= BUDGET_WARN * p.daily_budget:
+        if kind not in ("demand", "urgent") and used >= BUDGET_WARN * p.daily_budget:
             raise BudgetExceeded(f"{h.name}: past {round(100 * BUDGET_WARN)} % of the daily budget", url, h.name)
 
     def allow(self, host, kind="prefetch"):
@@ -634,23 +663,33 @@ class Fetcher:
             return False
         if self.offline_flag or h.breaker.is_open():
             return False
-        if kind == "demand":
+        if kind in ("demand", "urgent"):
             return True
         reserve = PREFETCH_RESERVE if kind == "prefetch" else BACKGROUND_RESERVE
         lv = h.bucket.level()
         return lv >= 1.0 - TOKEN_EPS and lv > reserve * h.policy.burst
 
     def _acquire(self, h, url, kind):
-        """A request slot and a token for one attempt (raises Deferred / RateLimited)."""
+        """A request slot and a token for one attempt (raises Deferred / RateLimited). Returns the semaphore taken
+        (_release gives it back)."""
         p = h.policy
+        if kind == "urgent":
+            sem = h.urgent_sem if h.urgent_sem.acquire(blocking=False) else h.sem
+            if sem is h.sem and not h.sem.acquire(timeout=p.max_wait):
+                raise RateLimited(f"{h.name}: no free request slot within {p.max_wait:.0f} s", url, h.name)
+            if not h.bucket.take(p.max_wait):
+                sem.release()
+                wait = h.bucket.wait_time()
+                raise RateLimited(f"{h.name}: rate limited for {wait:.1f} s", url, h.name, retry_after=wait)
+            return sem
         if kind == "demand":
             if not h.sem.acquire(timeout=p.max_wait):
                 raise RateLimited(f"{h.name}: no free request slot within {p.max_wait:.0f} s", url, h.name)
-            if not h.bucket.take(p.max_wait):
+            if not h.bucket.take(p.max_wait, floor=URGENT_TOKENS):
                 h.sem.release()
                 wait = h.bucket.wait_time()
                 raise RateLimited(f"{h.name}: rate limited for {wait:.1f} s", url, h.name, retry_after=wait)
-            return
+            return h.sem
         if not h.sem.acquire(blocking=False):
             self._bump(h, "deferred")
             raise Deferred(f"{h.name}: busy, {kind} dropped", url, h.name)
@@ -659,6 +698,7 @@ class Fetcher:
             h.sem.release()
             self._bump(h, "deferred")
             raise Deferred(f"{h.name}: bucket low, {kind} dropped", url, h.name)
+        return h.sem
 
     def _admit(self, url, kind):
         """Everything before the network: (Host, is_probe). The caller then _acquire()s per attempt."""
@@ -705,7 +745,7 @@ class Fetcher:
                         raise HostUnavailable(f"{h.name} unavailable for {wait:.0f} s (circuit open)", url,
                                               h.name, retry_after=wait)
                     probe = probe or probe2
-                self._acquire(h, url, kind)
+                sem = self._acquire(h, url, kind)
                 try:
                     self._count(h, "requests")
                     t0 = self.clock()
@@ -718,8 +758,10 @@ class Fetcher:
                         err = FetchFailed(f"{url}: {type(e).__name__}: {e}", url, h.name)
                         continue
                     elapsed = self.clock() - t0
+                    if NETLOG:
+                        _netlog(url, hd, status, body)
                 finally:
-                    h.sem.release()
+                    sem.release()
                 res = self._classify(h, url, status, {k.lower(): v for k, v in (rh or {}).items()}, body, elapsed)
                 probe = False               # the breaker has its verdict
                 if isinstance(res, Response):
@@ -791,7 +833,7 @@ class Fetcher:
         Retry-After are honoured) and is re-raised."""
         h, probe = self._admit(url, kind)
         try:
-            self._acquire(h, url, kind)
+            sem = self._acquire(h, url, kind)
         except FetchError:
             if probe:
                 h.breaker.release_probe()
@@ -816,7 +858,7 @@ class Fetcher:
             self._classify(h, url, s.status, {}, b"", self.clock() - t0)
             self._count(h, "bytes", max(0, s.nbytes))
         finally:
-            h.sem.release()
+            sem.release()
 
     # --- counters, budgets, persistence ------------------------------------------------------
     def _today(self):

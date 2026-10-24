@@ -14,7 +14,8 @@
 -- Shared generation (the user, 2026-10-22: "3 players in Utah and 1 in Italy ... the Utah players split generation
 -- between each other"): players near each other converge onto one anchor (pickAnchor: within ADOPT_M, the one most of
 -- them use; a teleport next to them lands on it, core.teleportTo / adoptAnchor; otherwise a smooth rebaseTo), and
--- our world server serves its group (the "share" message: its port and code go out in our poses); the plugin sends
+-- our world server serves its group (the "share" message, on the port the plugin's bngeConfig names: its port and code
+-- go out in our poses); the plugin sends
 -- each player the others on its anchor (bngePeers), handed to the world server ("peers"), which splits the far tiles
 -- among them (server/peerwork.py).
 -- BeamMP's files are not changed: its client events, its own functions, and mpanchor's wrap of positionGE.handle.
@@ -29,6 +30,8 @@ M.DAMAGE_SETTLE_S = 2
 M.DAMAGE_NEAR_M = 2000      -- a player this near sees our cars' damage (sendDamage)
 M.STATUS_S = 5              -- the session's state to the log and STATUS_FILE this often
 M.STATUS_FILE = '/temp/beamngEarth/mpsession_status.json'
+M.CONFIG_WAIT_S = 10        -- the server's settings waited for this long before sharing without them (an older plugin
+                            -- sends none)
 M.ADOPT_M = 7500            -- another player's anchor this near is ours to share (half the rebase distance: no loop)
 M.CONVERGE_S = 5            -- the anchor checked this often (converge)
 M.SETTLE_S = 10             -- ... and not within this of our own anchor's last change
@@ -43,6 +46,8 @@ local camPlaced = false     -- the free camera put on the ground once (BeamMP jo
 local lastPlayers = -1      -- (the log: the player count as last logged)
 local stats = { anchors = 0, go = 0, poses = 0, converged = 0, peers = 0 }
 local share = nil           -- { port, code } of our world server's group service (onShare); false: asked
+local config = nil          -- the server's settings (bngeConfig { sharePort }), nil until they come
+local configWait = 0        -- s waited for them
 local convergeIn = 0
 local anchorSince = 0       -- seconds our anchor has been the same (converge's settle)
 local lastAnchorKey = nil
@@ -95,7 +100,10 @@ end
 -- Pure: should our car's full damage go out now? newcomer: a player came near; damage, sent: now and at the last
 -- send (nil: never); settled: seconds it has differed. -> send, settled (updated)
 function M.damageDue(newcomer, damage, sent, settled, dt)
-  if newcomer then return true, 0 end
+  -- (a newcomer gets our car's full state only when it has damage to show: an undamaged car is the one BeamMP spawned
+  -- there already, and every join sent every nearby player's every car to every client, 2026-10-23: "the game freezes
+  -- when players join")
+  if newcomer then return (damage or 0) >= M.DAMAGE_STEP, 0 end
   if not damage or math.abs(damage - (sent or 0)) < M.DAMAGE_STEP then return false, 0 end
   settled = (settled or 0) + dt
   return settled >= M.DAMAGE_SETTLE_S, settled
@@ -155,6 +163,8 @@ local switchLog = {}        -- (test 'switch') { { t, what, active, ownThere } }
 local awayLog = {}          -- (test 'away') { { t, what, lat, lon } }
 local lateGoTo = nil         -- (test 'late': the go-to held until TEST_LATE_S)
 M.TEST_LATE_S = 45
+M.TEST_DELREMOTE_S = 40
+M.TEST_DROP_S, M.TEST_DROP_M = 40, 2500
 local brokenOf = {}         -- (test) remote game vehicle id -> broken beams
 
 -- (test) a remote car's broken beams, from its vehicle Lua
@@ -244,6 +254,26 @@ local function testStep(dt)
       note('10 s after switching back')
     end
   end
+  -- 'delremote': TEST_DELREMOTE_S after the car, the other players' cars removed here, as a player does for frames (the
+  -- restore must leave them removed; 'oldrestore': 1.6.0's restore rule, for the before)
+  if test.delremote and testCarAt and not test.deleted and testClock - testCarAt > M.TEST_DELREMOTE_S and remoteOwners then
+    local owners = remoteOwners()
+    for gid in pairs(owners) do
+      local o = vehicle(gid)
+      if o then
+        test.deleted = true
+        o:delete()
+        log('I', 'beamngEarth', 'BeamMP test: removed the other player\'s car ' .. tostring(gid))
+      end
+    end
+  end
+  -- 'drop': TEST_DROP_S after the car, our car moved TEST_DROP_M east (BeamMP's teleport to a player far off our block)
+  if test.drop and testCarAt and not test.dropped and veh and testClock - testCarAt > M.TEST_DROP_S then
+    test.dropped = true
+    local p = veh:getPosition()
+    veh:setPosition(vec3(p.x + M.TEST_DROP_M, p.y, p.z + 5))
+    log('I', 'beamngEarth', 'BeamMP test: car moved ' .. M.TEST_DROP_M .. ' m east')
+  end
   if test.damage and testCarAt and not testDamaged and veh and testClock - testCarAt > M.TEST_DAMAGE_S then
     testDamaged = true
     -- a real crash (dropped from 20 m): dents, which BeamMP itself does not send; the other player's copy shows them
@@ -279,22 +309,30 @@ end
 
 -- Cars of other players that the game deleted here (BeamMP: isDeleted, drawn as its placeholder sphere; before
 -- mpanchor.FAR_M a teleport put them thousands of km out, where the physics broke) come back with BeamMP's own
--- restorePlayerVehicle once their owner is within RESTORE_M of us, at most every RESTORE_AGAIN_S per player.
-M.RESTORE_M, M.RESTORE_AGAIN_S = 20000, 15
+-- restorePlayerVehicle once their owner is within RESTORE_M of us, at most every RESTORE_AGAIN_S per player. Only a car
+-- our world could have broken (mpanchor.wasFar: it was beyond FAR_M) and RESTORE_MAX times at most: isDeleted is also a
+-- car this player removed on purpose (fewer cars, more frames), and respawning every one of those every 15 s (each a
+-- spawn: a freeze, and BeamMP's "Trying to respawn" notice) fits the 1.6.0 players' "multiplayer freezing" (2026-10-23).
+M.RESTORE_M, M.RESTORE_AGAIN_S, M.RESTORE_MAX = 20000, 15, 2
 local restoredAt = {}       -- owner name -> clock of the last restore
+local restores = {}         -- server vehicle string -> restores asked for it
 local clock = 0
 function M.restoreDeleted(lat, lon)
+  local mpanchor = require('beamngEarth/mpanchor')
   local v = mp()
   if not v or type(v.getVehicles) ~= 'function' or type(v.restorePlayerVehicle) ~= 'function' then return 0 end
   local ok, all = pcall(v.getVehicles)
   if not ok or type(all) ~= 'table' then return 0 end
   local n = 0
-  for _, veh in pairs(all) do
+  for sid, veh in pairs(all) do
     local a = type(veh) == 'table' and veh.isDeleted == true and not veh.isLocal and veh.ownerName
+      and (test.oldrestore or (mpanchor.wasFar(tostring(sid)) and (restores[tostring(sid)] or 0) < M.RESTORE_MAX))
       and anchors[tostring(veh.ownerID)]
     if a and tonumber(a.lat) and tonumber(a.lon) and M.dist(lat, lon, tonumber(a.lat), tonumber(a.lon)) <= M.RESTORE_M
         and clock - (restoredAt[veh.ownerName] or -math.huge) >= M.RESTORE_AGAIN_S then
       restoredAt[veh.ownerName] = clock
+      restores[tostring(sid)] = (restores[tostring(sid)] or 0) + 1
+      stats.restored = (stats.restored or 0) + 1
       log('I', 'beamngEarth', 'BeamMP: ' .. tostring(veh.ownerName) .. '\'s deleted car brought back')
       pcall(v.restorePlayerVehicle, veh.ownerName)
       n = n + 1
@@ -352,6 +390,21 @@ function M.onShare(msg)
   local port = tonumber(msg.port)
   share = port and { port = port, code = tostring(msg.code or ''), weight = tonumber(msg.weight) } or false
   log('I', 'beamngEarth', 'BeamMP: sharing generation on port ' .. tostring(port))
+end
+
+-- The server's settings (the plugin's bngeConfig, at our first pose): the port our world server shares on.
+local function onConfig(data)
+  local ok, d = pcall(jsonDecode, data)
+  if not ok or type(d) ~= 'table' then return end
+  config = d
+  log('I', 'beamngEarth', 'BeamMP: the server\'s sharing port ' .. tostring(d.sharePort))
+end
+
+-- Pure: the "share" request for our world server: the server's port when it is a usable one.
+function M.shareRequest(cfg)
+  local port = cfg and tonumber(cfg.sharePort)
+  if port and (port ~= math.floor(port) or port < 1024 or port > 65535) then port = nil end
+  return { type = 'share', port = port }
 end
 
 local function onPeers(data)
@@ -434,6 +487,7 @@ function M.update(dt, anchor, player)
     AddEventHandler('bngeAnchors', onAnchors, 'beamngEarth')
     AddEventHandler('bngeGoTo', onGoTo, 'beamngEarth')
     AddEventHandler('bngePeers', onPeers, 'beamngEarth')
+    AddEventHandler('bngeConfig', onConfig, 'beamngEarth')
     handlers = true
   end
   local mpanchor = require('beamngEarth/mpanchor')
@@ -494,9 +548,10 @@ function M.update(dt, anchor, player)
       anchors = anchors, stats = stats, hidden = hidden, remote = remote, own = own, player = player and { x = player.x,
       y = player.y, z = player.z, camera = player.camera } or nil }, true)
   end
-  if share == nil then          -- our world server's group service, asked once a session (its answer: onShare)
-    share = false
-    require('beamngEarth/net').send({ type = 'share' })
+  configWait = configWait + (dt or 0)
+  if share == nil and (config or configWait >= M.CONFIG_WAIT_S) then
+    share = false               -- our world server's group service, asked once a session (its answer: onShare), on
+    require('beamngEarth/net').send(M.shareRequest(config))     -- the server's port
   end
   if not anchor then return end
   placeCamera(player)
@@ -588,8 +643,8 @@ function M.reset()
     if veh then veh:setActive(1) end
   end
   deactivated, anchors, poseIn, hideIn, joined, wentTo, camPlaced, lastPlayers = {}, {}, 0, 0, false, false, false, -1
-  members, sentDamage, damageSince, restoredAt = {}, {}, {}, {}
-  share, convergeIn, anchorSince, lastAnchorKey = nil, 0, 0, nil
+  members, sentDamage, damageSince, restoredAt, restores = {}, {}, {}, {}, {}
+  share, config, configWait, convergeIn, anchorSince, lastAnchorKey = nil, nil, 0, 0, 0, nil
   stats, statusIn = { anchors = 0, go = 0, poses = 0, converged = 0, peers = 0 }, M.STATUS_S
   require('beamngEarth/mpanchor').reset()
 end

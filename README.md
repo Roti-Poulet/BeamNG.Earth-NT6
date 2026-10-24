@@ -101,11 +101,16 @@ the mod, report problems, and get an IP to join a BeamMP.Earth server (see [Mult
 - Saved places and recent places.
 
 **Interface and tools**
-- A slim status bar (street, town, country, world loading), a connection banner when something is
+- A slim status bar (street, town, country, and under it the loading progress of the ground, roads & buildings, trees and
+  distant land after a teleport), the Earth coordinates above the minimap, a connection banner when something is
   wrong and the data credits on screen, as BeamNG UI apps in a ".Earth" app layout (based on Freeroam's;
   move or resize them in the UI apps editor), and a one-time welcome page about the project.
 - Settings in the pause menu, keybinds, in-game reports (notes and performance recordings to share), and a
   wireframe view (Ctrl+Alt+W) that shows how the ground, the distant terrain and the roads are built.
+- A diagnostic log to send when something is slow: the world server's `logs/server.log` (in
+  `%LOCALAPPDATA%\beamng-earth` on Windows, `~/.cache/beamng-earth` on Linux) records your hardware and settings, every
+  hitch and frame-rate drop with where it happened and what was loading, and a summary every minute
+  ([docs/QUICKSTART.md](docs/QUICKSTART.md#something-wrong-tell-us)).
 - Easy setup: one download per system (Windows .exe, Linux AppImage) that installs the mod and starts the server
   and the game; from the source, `install.py` installs everything and `start.py` keeps the mod in sync.
 - Runs on a Steam Deck (aim: 30 fps on the Handheld graphics preset).
@@ -168,24 +173,29 @@ BeamNG.Earth runs on [BeamMP](https://beammp.com/) servers (in testing): drive t
 1. Install BeamMP (its launcher) and the BeamNG.Earth app (see Install and play above), the same version as the
    server's. Every player needs the BeamNG.Earth app running: each builds the world on their own computer.
 2. Get an IP: join the [Discord server](https://discord.gg/tgf) for the address of a BeamMP.Earth server.
-3. Start the BeamNG.Earth app and the BeamMP launcher, in either order: the app starts the game, or, if the BeamMP
-   launcher started it already, just the world server (on Linux the game then runs without the grass patch).
-4. In the game: Multiplayer > Direct Connect with the server's IP and port.
+3. Start the **BeamMP launcher first** and wait until the game has fully started (the main menu).
+4. **Then** start the BeamNG.Earth app: it sees the running game and starts just the world server (on Linux the game
+   then runs without the grass patch). If the mod was just installed, updated or turned back on (joining a BeamMP
+   server turns other mods off), the app has the game reload its Lua so it loads the mod without a restart (Linux
+   native game and Windows; not the Windows build under Proton).
+5. In the game: Multiplayer, then join a server running the BeamMP.Earth plugin (Direct Connect with its IP and port).
 
 You are sent to where the others are. Cars show in the right place, with their dents, in everyone's world; other
 players show on the world map (**M**) as green arrows; players far away (another country) are hidden until you meet.
 
 **Sharing the work:** players near each other share one world origin and split the building of the distant
 landscape (each piece is built once and sent to the others; faster computers take more), while a player far from
-everyone builds their own. For that the other players must reach your computer on TCP port 47621: on the same network
-it just works; over the internet, forward that port in your router, or you simply build everything yourself. Another
-port: set the environment variable `BNGE_SHARE_PORT` before starting the app.
+everyone builds their own. For that the other players must reach your computer on a TCP port, 47621 unless the server
+picks another (the server tells your app which): on the same network it just works; over the internet, forward that
+port in your router, or you simply build everything yourself. A port of your own: set the environment variable
+`BNGE_SHARE_PORT` before starting the app.
 
 **Hosting a server:** download `BeamNG.Earth-BeamMP-Server-<version>.zip` from the
 [Releases](https://github.com/TecnaGamer/BeamNG.Earth/releases) page and follow the guide inside
 (`BeamNG.Earth-README.md`). In short: unzip it into a BeamMP server's folder, set
 `Map = "/levels/beamng_earth/info.json"` in `ServerConfig.toml`, forward the server's port (TCP and UDP) for players
-over the internet, and start it (its log shows `[BeamNG.Earth] plugin loaded`). The server needs no world data and
+over the internet, and start it (its log shows `[BeamNG.Earth] plugin loaded`). The players' sharing port (47621) is
+`G.SHARE_PORT` near the top of `Resources/Server/BeamNGEarth/main.lua`. The server needs no world data and
 little CPU. From the source, `python3 tools/package.py --beammp` builds the same zip.
 
 ## Data sources and attribution

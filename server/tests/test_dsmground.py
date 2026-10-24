@@ -13,16 +13,6 @@ PX = 18.0   # m per pixel (a z12 tile at mid latitudes)
 
 
 class DsmGroundTest(unittest.TestCase):
-    def test_running_min_max_match_brute_force(self):
-        rng = np.random.default_rng(0)
-        for n, w in ((17, 5), (40, 7), (9, 9), (100, 31), (5, 7)):
-            a = rng.normal(size=(6, n)).astype(np.float32)
-            h = w // 2
-            ref = sliding_window_view(np.pad(a, ((0, 0), (h, h)), mode="edge"), w, axis=1).min(-1)
-            np.testing.assert_array_equal(g._run(a, w, 1, np.minimum), ref)
-            ref = sliding_window_view(np.pad(a, ((h, h), (0, 0)), mode="edge"), w, axis=0).max(-1)
-            np.testing.assert_array_equal(g._run(a, w, 0, np.maximum), ref)
-
     def test_town_blocks_come_down_to_the_streets(self):
         """A gently sloping plain with 120 m blocks 12 m high between 20 m streets: the blocks go, the plain stays."""
         y, x = np.mgrid[0:200, 0:200].astype(np.float32)

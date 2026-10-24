@@ -74,6 +74,17 @@ tools/reports.py` lists them all): it opens issue.md in your editor, then the ne
 can drag `screenshot.jpg` into the issue. The "Open GitHub issue page" button in the game does the
 same without the edit step.
 
+**The log file.** For freezes, stutters or anything slow, the world server's log is the most useful thing to send
+(Discord or the GitHub issue): `%LOCALAPPDATA%\beamng-earth\logs\server.log` on Windows,
+`~/.cache/beamng-earth/logs/server.log` on Linux and the Steam Deck. Send it right after it happens: it starts over each
+time the BeamNG.Earth app starts. Besides how long each piece of ground took to build, it has your computer and
+graphics settings (`game: machine:` lines) and the game's own performance lines:
+- `game: perf hitch`: a frame of 0.1 s or more, with where you were (latitude, longitude), your speed, which parts of
+  the mod and of the game took the time, and what the mod was loading;
+- `game: perf drop` / `perf back`: the frame rate below about two thirds of your usual for 5 s or more, and when it
+  came back;
+- `game: perf minute`: every minute, the average frame rate, the 1 % low and the worst frame with its cause.
+
 ## Troubleshooting
 - **DuckDB fails to install on Windows**: the installer uses a prebuilt DuckDB package instead of
   compiling it. If pip reports **"No matching distribution found"** for DuckDB, install **64-bit

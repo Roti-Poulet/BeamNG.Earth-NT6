@@ -438,6 +438,21 @@ class ChainTest(unittest.TestCase):
         self.render(im)
         self.assertEqual(len(im.requests), n)     # render found everything prefetched
 
+    def test_prefetch_soon_past_the_budget(self):
+        """A host that takes no prefetch (past 80 % of its daily budget): the far field's next tiles (soon) still go,
+        as demand; a plain prefetch does not (GitHub #116)."""
+        def serve(name, z, x, y):
+            return self.tile(name, z, x, y)
+        im = FakeNet(self.tmp.name, serve, chain=("eox2023",), tone=0.0)
+        im.fetcher.allow = lambda host, kind="prefetch": kind == "demand"
+        f = g.EnuFrame(LAT0, LON0)
+        im.prefetch(f, 0.0, 0.0, 256.0, 64)
+        time.sleep(0.3)
+        self.assertFalse(im.requests, "a plain prefetch past the budget: nothing")
+        im.prefetch(f, 0.0, 0.0, 256.0, 64, soon=True)
+        time.sleep(0.3)
+        self.assertTrue(im.requests and all(r[0] == "eox2023" for r in im.requests))
+
     def test_parse_chain_and_attribution(self):
         self.assertIsNone(imagery.parse_chain("off"))
         self.assertEqual(imagery.parse_chain("usgs,eox2016"), ("usgs", "eox2016"))

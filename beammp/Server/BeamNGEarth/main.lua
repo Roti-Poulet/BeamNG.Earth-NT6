@@ -8,6 +8,7 @@
 --     bngePose, every 2 s and at once when its anchor changes), its name and heading (degrees from north; none
 --     without a car: the world map's arrows), to everyone each TICK_MS and at once when an anchor changes;
 --   - bngeGoTo { lat, lon }: a player who joins is sent to the others (the longest-joined player's place);
+--   - bngeConfig { sharePort }: the server's settings (above), to a player at their first pose;
 --   - bngePeers { me, members = [{ id, host, port, code, weight }] }: the players on the same anchor whose world server
 --     shares generation (their pose's sp / sc / sw; host: the address BeamMP sees; weight: its machine's capacity,
 --     its share of the tiles), each tick when its group changed. Players
@@ -15,6 +16,13 @@
 -- Positions stay latitude / longitude here: no coordinates are converted on the server. Nothing of BeamMP itself is
 -- changed: only its events (MP.RegisterEvent, MP.TriggerClientEvent).
 local G = {}
+
+-- ===== Settings: edit here, then restart the BeamMP server ========================================================
+-- The TCP port every player's world server listens on to share world building with the players near them (the
+-- others connect to it: over the internet, each player forwards this port to their computer; on one network nothing
+-- is needed). Sent to each player when they join. A player whose port is taken uses the next free one (up to 9 more).
+G.SHARE_PORT = 47621
+-- ===================================================================================================================
 
 G.PROTO = 2                 -- (2: anchors for the clients' conversion; 1 grouped players by anchor)
 G.MEET_M = 3000             -- a joining player farther than this from the others is sent to them
@@ -136,6 +144,13 @@ function G.tick(dt)
   return G.anchors(G.live())
 end
 
+-- The settings each player gets (bngeConfig): the sharing port, when it is a usable one.
+function G.config()
+  local port = tonumber(G.SHARE_PORT)
+  port = port and math.floor(port)
+  return { sharePort = (port and port >= 1024 and port <= 65535) and port or nil }
+end
+
 -- ---------------------------------------------------------------------------------------------------------------
 -- BeamMP wiring (absent in the offline tests)
 if MP and MP.RegisterEvent then
@@ -152,6 +167,7 @@ if MP and MP.RegisterEvent then
       if okI and type(ids) == 'table' and type(ids.ip) == 'string' then p.ip = ids.ip end
     end
     if p and not known then
+      MP.TriggerClientEvent(pid, 'bngeConfig', encode(G.config()))
       print(string.format('[BeamNG.Earth] %s at %.5f, %.5f (anchor %s)', tostring(p.name), p.lat, p.lon,
         G.key(p.aLat, p.aLon)))
     end
@@ -183,7 +199,8 @@ if MP and MP.RegisterEvent then
   MP.RegisterEvent('onPlayerDisconnect', 'BNGE_onLeave')
   MP.RegisterEvent('BNGE_tick', 'BNGE_tick')
   MP.CreateEventTimer('BNGE_tick', G.TICK_MS)
-  print('[BeamNG.Earth] plugin loaded')
+  print(string.format('[BeamNG.Earth] plugin loaded (players share world building on TCP port %s)',
+    tostring(G.config().sharePort or 'their own default')))
 end
 
 return G

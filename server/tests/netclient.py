@@ -14,6 +14,7 @@ def stop_server(proc):
     """Stop an earthd a test started, its worker processes with it. On Windows terminate() kills the server alone:
     its spawned pool workers (each holds both ends of its task queue, so no EOF) lived on and kept earthfast.pyd
     locked. Safe to call twice (tearDown, then the cleanup a failed setUp leaves)."""
+    kids = _children(proc.pid)
     if proc.poll() is None:
         if os.name == "nt":
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
@@ -24,6 +25,22 @@ def stop_server(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    # its workers exit on their own within blockworker.PARENT_POLL_S, still writing to the session folder until then
+    # (a test's temp folder removed under them: "Directory not empty", 1 run in 6)
+    end = time.monotonic() + 10
+    while kids and time.monotonic() < end:
+        kids = [k for k in kids if os.path.exists(f"/proc/{k}")]
+        if kids:
+            time.sleep(0.1)
+
+
+def _children(pid):
+    """The pids of a process's children (Linux; [] elsewhere)."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(k) for k in f.read().split()]
+    except (OSError, ValueError):
+        return []
 
 
 class Client:

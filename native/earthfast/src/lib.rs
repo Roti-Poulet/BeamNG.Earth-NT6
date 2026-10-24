@@ -1,6 +1,11 @@
 //! Geometry kernels for the world server (server/fast.py wraps them, with the Python versions as the fallback).
 //! All coordinates are metres in the anchor's local frame, f64.
 mod gpu;
+mod dsm;
+mod vegmask;
+mod roadgeom;
+mod shore;
+mod photofill;
 
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, IntoPyArray};
 use pyo3::types::PyBytes;
@@ -2853,9 +2858,19 @@ fn mesh_warp<'py>(py: Python<'py>, img: PyReadonlyArray3<'py, u8>, qx: PyReadonl
     let out = py.allow_threads(|| {
         let (ih, iw, bands) = (a.shape()[0] as i64, a.shape()[1] as i64, a.shape()[2]);
         let mut out = numpy::ndarray::Array3::<u8>::zeros((px, px, bands));
+        // each mesh row writes its own band of output rows: the bands on up to 4 threads (the same numbers; a block's
+        // ground photo waits for two of these warps, ~50 ms each on a Steam Deck)
+        let band_len = (cw * px * bands).max(1);
+        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4);
+        let flat = out.as_slice_mut().expect("a new array is contiguous");
+        let mut bands_v: Vec<(usize, &mut [u8])> = flat.chunks_mut(band_len).enumerate().filter(|(r, _)| *r < cells).collect();
+        let mut groups: Vec<Vec<(usize, &mut [u8])>> = (0..nthreads).map(|_| Vec::new()).collect();
+        for (k, item) in bands_v.drain(..).enumerate() {
+            groups[k % nthreads].push(item);
+        }
         let clipx = |x: i64| -> usize { (if x < 0 { 0 } else if x < iw { x } else { iw - 1 }) as usize };
         let clipy = |y: i64| -> usize { (if y < 0 { 0 } else if y < ih { y } else { ih - 1 }) as usize };
-        for r in 0..cells {
+        let warp_band = |r: usize, band: &mut [u8]| {
             for c in 0..cells {
                 let (bx0, by0) = (c * cw, r * cw);
                 let (bx1, by1) = (((c + 1) * cw).min(px), ((r + 1) * cw).min(px));
@@ -2925,12 +2940,22 @@ fn mesh_warp<'py>(py: Python<'py>, img: PyReadonlyArray3<'py, u8>, qx: PyReadonl
                             }
                         }
                         for b in 0..bands {
-                            out[[y, x, b]] = px_[b];
+                            band[((y - by0) * px + x) * bands + b] = px_[b];
                         }
                     }
                 }
             }
-        }
+        };
+        std::thread::scope(|sc| {
+            for g in groups {
+                let wb = &warp_band;
+                sc.spawn(move || {
+                    for (r, band) in g {
+                        wb(r, band);
+                    }
+                });
+            }
+        });
         out
     });
     out.into_pyarray(py)
@@ -3792,6 +3817,15 @@ fn rtin_mesh<'py>(py: Python<'py>, h: PyReadonlyArray2<'py, f64>, max_err: f64)
 #[pymodule]
 fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(island_ring_rays, m)?)?;
+    m.add_function(wrap_pyfunction!(dsm::dsm_ground, m)?)?;
+    m.add_function(wrap_pyfunction!(dsm::fill_holes, m)?)?;
+    m.add_function(wrap_pyfunction!(roadgeom::dedupe_polyline, m)?)?;
+    m.add_function(wrap_pyfunction!(shore::shore_steps, m)?)?;
+    m.add_function(wrap_pyfunction!(shore::carve_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(vegmask::mask_polys, m)?)?;
+    m.add_function(wrap_pyfunction!(vegmask::road_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(vegmask::disc_max, m)?)?;
+    m.add_function(wrap_pyfunction!(vegmask::thin_tops, m)?)?;
     m.add_function(wrap_pyfunction!(points_inside, m)?)?;
     m.add_function(wrap_pyfunction!(polyline_dist, m)?)?;
     m.add_function(wrap_pyfunction!(clear_of, m)?)?;
@@ -3853,7 +3887,8 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(points_on_tris, m)?)?;
     m.add_function(wrap_pyfunction!(wet_run_inside, m)?)?;
     m.add_function(wrap_pyfunction!(paint_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(photofill::fill_photo, m)?)?;
     m.add_function(wrap_pyfunction!(rtin_mesh, m)?)?;
-    m.add("VERSION", 60)?;
+    m.add("VERSION", 68)?;
     Ok(())
 }
