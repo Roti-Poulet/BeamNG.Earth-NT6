@@ -66,6 +66,7 @@ FLOATS = ("lanes", "width", "maxspeed", "osm_layer")
 TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "osm_highway")
 UNBUILT = ("construction", "proposed")      # osm_highway's values: not drawn (roads.unbuilt)
 NAME_MATCH_M = 25.0     # m a segment's middle may lie outside the bbox of the same-named way it takes the tags of
+ONEWAY_YES = ("yes", "1", "-1", "true")
 
 
 # Racetracks (GitHub #143): Overture's transportation theme has no highway=raceway (Daytona's oval and road course, the
@@ -372,4 +373,20 @@ def join(feats, tags):
         src = ids if c == "osm_oneway" else named
         feats.attrs[c if c.startswith("osm_") else "osm_" + c] = mg.text_column(
             [str(tags.get(w, {}).get(c, "")) if w is not None else "" for w in src])
+    # A way without a lane count takes the count of the same-named way around it going the same way (one-way or
+    # not): OpenStreetMap's lanes ahead of the class's width (Portland's arterials carry lanes on some of their ways
+    # only, the rest were drawn at the class's guess, the user 2026-10-27).
+    lanes, ows = feats.attrs["osm_lanes"], feats.attrs["osm_oneway"]
+    names = feats.attrs.get("name")
+    sense = {}
+    for w, t in tags.items():
+        if "lanes" in t and t.get("name") and all(k in t for k in ("bx0", "by0", "bx1", "by1")):
+            key = (str(t["name"]), str(t.get("osm_oneway", "")) in ONEWAY_YES)
+            sense.setdefault(key, []).append((w, t["bx0"], t["by0"], t["bx1"], t["by1"]))
+    for i in range(n if sense and names is not None else 0):
+        if np.isnan(lanes[i]):
+            nm = str(names[i])
+            w = _named_way(feats, i, {nm: sense.get((nm, str(ows[i]) in ONEWAY_YES), [])})
+            if w is not None:
+                lanes[i] = float(tags[w]["lanes"])
     return feats

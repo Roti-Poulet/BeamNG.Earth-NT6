@@ -2,6 +2,257 @@
 
 What changed in each release of BeamNG.Earth, newest first.
 
+## 1.7.2 beta (2026-10-29)
+
+> **Join the TGForever Discord, [discord.gg/tgf](https://discord.gg/tgf), to chat, get help, report bugs or help
+> develop the mod.** For help, that includes multiplayer:
+> BeamNG.Earth isn't like a normal BeamNG mod (it runs its own app next to the game), so if something isn't working
+> with BeamMP, it's almost certainly a BeamNG.Earth problem, not a BeamMP one. Please don't contact the BeamMP team or
+> open BeamMP support tickets about it. BeamNG.Earth servers are hidden from players who don't run BeamNG.Earth
+> (BeamMP can't install it for them: it needs its own app), so they only show in the BeamNG.Earth tab of BeamMP's
+> server browser.
+
+Works with BeamNG.drive 0.40.4.
+
+### New
+- **See what's downloaded on the map**: Layers > Cache colours the map by what is on your disk (some data, the far
+  view's data, or everything needed to drive there), with views for elevation, aerial photos and map data, and
+  **World built**: where the terrain, far view, roads and buildings are already generated and kept on disk.
+- **Pre-cache an area**: drag a box on the map (the Pre-cache area button or Shift+drag) to download every bit of
+  elevation, aerial photo and map data it needs, with the size, download and time shown first. It downloads in the
+  background when the game isn't loading anything, picks up where it left off after a restart, and Clear cache keeps
+  your pre-cached areas.
+- **Pre-cache a GPS route**: Pre-cache route on the map's GPS box downloads everything along the planned route (a quarter
+  mile to 2 miles each side) the same way as a pre-cached area, starting from the route's start, and keeps it.
+- **Build the world ahead**: tick "Build the world too" when pre-caching an area or a route (up to 155 square miles) and
+  its roads, sidewalks, bridges, buildings and street furniture are built in the background as well, so arriving
+  there is much faster (Annapolis: the roads round the car were ready 4 seconds after a teleport instead of 23).
+  After a BeamNG.Earth update they are built again in the background.
+- **Download along the GPS route** (Settings > Storage): what a planned route downloads ahead by itself: the next 12
+  miles (as before), the whole route (up to 300 miles), or nothing.
+- **Players list on the map in multiplayer**: follow another player, show everyone, or set the GPS to them (thanks
+  iambobab, #459).
+- **Teleport without a car**: with no car the free camera goes to the place, and Go waits for the ground to load
+  (thanks iambobab, #460).
+
+### Improved
+- The download cache's size limit (Settings > Storage) is now typed in GB (any size; 0 for no limit) instead of
+  picked from a list.
+- **Steadier game speed**: the game's time no longer speeds up and slows down as much while the world loads around
+  you. A new setting, **Even frame pacing** (Graphics, on by default), keeps the time between frames steady, which
+  costs up to about a tenth of your frame rate; turn it off for the highest frame rate. It stays off below 30 fps.
+  Some of the mod's own work each frame was also cut (the far buildings' checks, new tree groups made while driving).
+- **Smoother, faster rebases** (the world's origin moving with you every 9 miles): roads, buildings, bridges,
+  street furniture and trees no longer disappear and get rebuilt around you; they are built once per place, kept,
+  and only the road surface is laid again (Fells Point: the roads within 300 m exact again after 0.4 s instead of
+  2.2 s, about 6x less work; Los Angeles 1.3 s instead of 4.7 s). Teleporting near a place you visited reuses it too.
+- **Faster far view after a rebase or teleport**: the aerial photos' shadow removal, colour matching and tone are
+  now done once per photo tile and kept on disk, so the far view's ground no longer redoes them for every new
+  origin (Kern River: the far view ready after a rebase in 8.7 s instead of 11.8 s, with about a quarter less
+  CPU; first visits are a bit faster too). It uses up to about 60 MB of the download cache per place.
+- Building colours, roofs and all-way stops are now chosen from each building's and junction's own map data, so they
+  stay the same wherever you start from (some buildings and junctions look different once).
+- **Bridges and tunnels at their real heights where measured data exists**: in the US, bridge decks follow the USGS
+  lidar survey of the bridge itself (the LA Four Level's ramps came out within about 2 inches of the survey, from
+  about 2.5 ft off); in France (IGN BD TOPO) and Norway (the national road database), bridges, tunnels and roads on
+  coarse terrain take the countries' own measured road heights (the Millau viaduct within an inch, from about 8 ft).
+  Elsewhere bridges are worked out from the terrain as before.
+
+### Fixed
+- Reduced the chance of speed-limit and highway signs appearing only when you are right next to them while driving:
+  they now come as soon as the roads under them are in (about 700 m ahead instead of about 300).
+- Turn arrows painted on the road now show the arrow the right way up (with game 0.40 straight-ahead lanes showed an
+  upside-down "EXIT" instead).
+- Reduced the chance of a freeway exit sign standing in a street's lane where an exit ramp comes down (Baltimore's
+  Guilford Avenue exit), and made one-destination exit signs their real size (they stood about 20 ft tall).
+- Reduced the chance of rivers that run underground in pipes being drawn as open water and carved into the ground
+  (thanks iknlm, #474).
+- Reduced the chance of large roundabouts getting a too-small island, entry stubs, or the aerial photo's road showing
+  through the island (thanks soifaxa, #468).
+- Reduced the chance of sidewalks, street lamps and stone bridge walls on rural divided highways (thanks
+  wyo-backroads, #458).
+- Reduced the chance of traffic cars being respawned again and again in a loop (thanks OmdevShastri, #493).
+- Reduced the chance of far-away trees staying summer green while the trees near you have their autumn colours: the
+  flat far versions of oaks, beeches, birches and aspens now take the season's colours too.
+- Reduced the chance of elevated ramps and viaduct stretches the map marks as ground being drawn at street level in
+  the US: the lidar survey along them decides (the Springfield Interchange: no more ramps under 15 ft over a road,
+  the Backlick Road bridge with its real clearance).
+- Reduced the chance of autodrive and traffic driving a few feet off their lanes where a ramp joins a motorway.
+- Reduced the chance of a hole or the end of a bridge wall in your way where a street leaves a bridge at an angle
+  (Charles Street over I-83 in Baltimore): such junctions get a paved pad with a railing only over the drop.
+- Reduced the chance of a viaduct ending in a drop to the street where the map starts a branch a few feet off its
+  split (Baltimore's Jones Falls Expressway had a 26 ft drop across the lanes; the Springfield Interchange a 44 ft
+  step), and of short stretches between two bridges being drawn at street level.
+- Reduced the chance of autodrive and traffic swerving or running off the road right after the world's origin moves
+  (every 9 miles): the AI's road map now moves with the world at once.
+- Reduced the chance of other players' cars in multiplayer standing a few yards off the road on high ground when
+  your world origins are far apart.
+
+Questions, bugs or just want to chat? Join the TGForever Discord: https://discord.gg/tgf
+
+## 1.7.1 beta (2026-10-29)
+
+> **Join the TGForever Discord, [discord.gg/tgf](https://discord.gg/tgf), to chat, get help, report bugs or help
+> develop the mod.** For help, that includes multiplayer:
+> BeamNG.Earth isn't like a normal BeamNG mod (it runs its own app next to the game), so if something isn't working
+> with BeamMP, it's almost certainly a BeamNG.Earth problem, not a BeamMP one. Please don't contact the BeamMP team or
+> open BeamMP support tickets about it. BeamNG.Earth servers are hidden from players who don't run BeamNG.Earth
+> (BeamMP can't install it for them: it needs its own app), so they only show in the BeamNG.Earth tab of BeamMP's
+> server browser.
+
+Works with BeamNG.drive 0.40.3.
+
+### New
+- **Settings in a tab of their own in the pause menu** (next to BeamMP's), in the game's own style, every page listed
+  down the side: Graphics, World, Interface, Multiplayer, Storage, Feedback, About, Developer.
+- **Quality presets and many more graphics settings**: Low / Medium / High / Ultra presets, plus an **Extreme**
+  preset that puts everything at its highest out to the real horizon (for strong PCs; never picked for you). New
+  settings: terrain detail (how far out the distant ground stays finely detailed), ground photo (1024 /
+  2048 / 4096, from the next level load), tree density and tree draw distance, building draw distance, object detail
+  (how far out models keep their finest detail, in BeamNG.Earth only; your game's own setting comes back when you
+  leave), grass draw distance, and the view distance. The first start picks a preset for your hardware (Medium on a
+  Steam Deck); settings you changed before are kept.
+- **What loads around you reaches the same distance in every direction**: roads, trees and buildings used to load in
+  a square around the car, so they reached farther towards its corners; they now load in a circle.
+- **Guard rails** (MAKAKAIglitch's pull request #205): guard rails mapped in OpenStreetMap are placed as the game's own
+  metal rail sections, following the road's slope, with flared end pieces. Bridges whose edges have mapped rails get
+  a low concrete curb with a rail on top instead of the full concrete wall, and rails leading onto a bridge join its rail.
+- **Canada** (spacedroogz-max's pull request #206): British Columbia's 10-15 cm aerial photos on the ground around
+  Vancouver and Victoria, and the distant terrain across southern Canada lined up with Natural Resources Canada's
+  lidar ground, so it no longer stands on the forest tops. The full lidar terrain and tree heights are there too, off
+  by default for now (they made first visits about a minute slower).
+- **Parking lots** (AnthonyGraceffa's pull request #442): mapped parking lots are paved in the ground photo and get
+  painted stall lines where the parked cars stand.
+- **Building colours** (hudsontadams's pull request #167): buildings with a mapped wall or roof colour or material
+  (brick, glass, a red roof ...) now show it, part by part.
+- **Highway signs on US freeways** (from cody196's contribution): exit signs at 1 mile, 1/2 mile and 1/4 mile and in
+  the gore, overhead destination signs with route shields, merge warnings and Interstate mile markers, from the signs
+  mapped in OpenStreetMap. Settings > World > Highway signs.
+- **Speed-limit signs everywhere**: the posted limit the AI drives, after junctions where it changes, past motorway
+  entrances and as reminders; US, Canadian ("MAXIMUM", GitHub #454) and European styles (mph in the UK).
+- **Median barriers on divided highways**: concrete walls, cable barriers or steel rails by the median's width and
+  the country's practice, open at crossovers and ramps; mapped concrete and cable barriers too.
+- **Rounded corners where country roads meet** (from cody196's contribution): the asphalt curves round the corner and
+  the gravel edge and edge lines follow it.
+
+### Improved
+- **Sharper road edges and ground** (top-down shots of Woodland Park, Colorado): the ground photo under the
+  car has twice the pixels per side, with the roads painted into it at about 20 inches a pixel and lined up exactly
+  with the road's lines (they sat about 3 ft to the south-west), and roads without
+  curbs get a gravel shoulder edge, so their edges are crisp instead of a blurred, stepped band.
+- **The road's colour, grip and lines line up**: the asphalt in the ground sat up to about 5 ft to one side of the
+  painted lines on some roads, and near one edge the tyres could be on dirt (and dirt's texture showed on the
+  asphalt) while still inside the lines. The asphalt's colour and its grip now lie exactly under the road's lines.
+- **Road markings by country** (from the national road marking manuals): line colours, widths and dash lengths now
+  follow the country (for example the US's 10 ft dashes every 40 ft, Germany's 6 m dashes on country roads, Britain's
+  shorter town patterns); US-style yellow left edge lines on divided roads and ramps; rural two-lane roads in the US
+  get a broken centre line, town streets a double yellow; dashes are real dashes now, without the grey smear between
+  them.
+- **Painted gores at freeway exits and entrances**: the wedge where a ramp splits from or joins a freeway is now
+  paved, with the wide white lines and the white chevrons pointing at oncoming traffic, as on the real roads.
+- **Bridges look and drive like the real ones** (jonathonbarton's PR #409): decks climb smoothly to what they cross
+  instead of humping, river bridges hold their real clearance over the water, lift and bascule bridges get their towers
+  and control houses, lens trusses span the river, and the parapets are solid concrete barriers.
+- **Motorway curves without banking bumps** (wyo-backroads' PR #410, with our fix): banking follows the whole curve.
+- **No street lamps along empty rural interstates** (wyo-backroads' PR #404); OpenStreetMap's lit tags are used.
+- **Lane counts from the map** (jonathonbarton's PR #405): a street keeps its lanes where one piece of it was mapped
+  without a count, and one-way streets join a two-way street on their own side of it.
+- **Smoother roads and junctions** (mpsteppe's PRs #289, #290): side roads meet the road they join at its height, and
+  mid-size and dirt roads follow fewer small bumps in the elevation data.
+- **Gas stations in Japan, and painted lots after a teleport** (FluffyProgramming's PR #401); big stations no longer
+  cause a hitch when they appear.
+- **Railways still under construction are no longer drawn** (OmdevShastri's PR #392).
+- **Country roads the right width**: small rural roads were drawn about 6 ft too wide (measured on official aerial
+  photos in Pennsylvania and Colorado); they now match, and in the US they get a centre line without edge lines, as
+  most of them have.
+- **Turn arrows and ladder crosswalks**: lanes mapped as turn lanes get their arrows before the junction, and US
+  crosswalks get the ladder style (the bars with a line along each side).
+- **Lane lines follow the map's lanes** where OpenStreetMap maps them: uneven lanes each way move the centre line,
+  centre turn lanes get their yellow lines, no-passing stretches get solid lines, and the traffic drives in the
+  lanes that are painted.
+- **Reduced the chance of a pale strip beside one edge of a road**: where the aerial photo's pavement is wider than
+  the mapped road or a little off it, that strip of the photo is now replaced with the ground beside it.
+- **Fewer trees on roads and sidewalks** (GitHub #424, #425): trees and bushes keep clear of the road's full drawn
+  width (parking lanes included) and of its sidewalks; street trees stand by the curb.
+- **Traffic lights no longer light every colour at once** where they don't switch (GitHub #415): those now show dark
+  lenses.
+- **Office towers at night look like a city at night**: Manhattan's glass towers lit up white from street to roof
+  (TGForever Discord). Their windows are now dimmer and about half of them are dark.
+
+### Fixed
+- Reduced the chance of concrete retaining walls standing beside country roads in front of natural banks (a low rocky
+  bank along US-163 in Utah had a long concrete wall): walls now stand only where the road was actually cut into the
+  ground.
+- Reduced the chance of the road's painted lines lying a few feet to one side of its asphalt and grip far from where
+  you started, on high ground (on US-163 in Utah, 8 miles out at 5,400 ft, they were about 7 ft apart): the lines,
+  shorelines, and the positions of cars across a rebase now follow the ground's own positions.
+- Reduced the chance of side streets humping up where they meet a road that dips under a bridge (Haven Street,
+  Baltimore).
+- Reduced the chance of a fixed view distance (the Low preset's 25 miles) being replaced by the horizon's distance
+  while driving or flying; switching back to the real horizon now brings the far view back at once.
+- Reduced the chance of the game speed seeming to pulse (speeding up and slowing down every fraction of a second) in
+  wooded places: the trees' updates no longer run when nothing changed.
+- Reduced the collision rebuild cost along railway tracks (the rails and sleepers no longer collide; cars ride on the
+  ballast) (from Madderose's contribution).
+- Road surfaces no longer cast hidden sun shadows (a little faster rendering) (from Madderose's contribution).
+- Reduced the chance of world server processes staying behind after closing on Windows (from Madderose's
+  contribution).
+- Reduced the chance of autodrive and traffic crawling at 30 km/h on narrow country roads with a higher limit
+  (GitHub #451, the Netherlands' 60 km/h roads).
+- **Underpasses are open roads under a bridge** (GitHub #450, the A-7 near Málaga; #228, #243, the A7 in
+  Germany): the map often marks the road under a highway as a short tunnel, and it was built as a tube in an
+  embankment, its vault and openings in the highway's lanes. A short road tunnel (under about 260 ft, counting all of
+  its pieces) with little ground over it is now a road under a bridge, as are streets over a railway the map marks
+  as a short tunnel (Chicago's streets over the Union Station tracks).
+- Reduced the chance of a highway dipping where a longer tunnel runs under it (about 9 ft at a culvert under the A-7
+  near Málaga), and of a tunnel's portal ending inside the lanes of a road crossing over it.
+- Reduced the chance of a hole in the road just outside a low tunnel's entrance (cars could fall through it),
+  depending on which way the entrance faced.
+- Reduced the chance of long mountain tunnels being left out because of a lake or stream far above them: the
+  Gotthard road tunnel (10.5 miles) has its entrances at Göschenen and Airolo again (TGForever Discord report).
+- Reduced the chance of roads still under construction being built as finished ones when the map's road details
+  missed them (the Gotthard road tunnel's second bore, due in 2029).
+- Reduced the chance of a tunnel entrance standing in the lanes of a road running alongside it (a service gallery's
+  arch and mound in the A2's lanes at Göschenen).
+- Motorway and main-road tunnels under shallow ground start where the map puts their entrance, as a covered
+  concrete section tall enough for trucks, instead of an open cut further in.
+- Motorway and main-road tunnels under shallow ground get concrete entrances instead of the stone arches of park
+  underpasses.
+- Reduced the chance of a street being dug into a walled trench under a railway where only coarse elevation data
+  exists (Perm, Russia, GitHub #414): the railway now rises on its embankment and the street stays at grade.
+- Reduced the chance of roads and buildings never loading after a road worker stopped answering ("roads & buildings
+  0/26"): the worker is restarted and its tiles built again (KyzoFox's pull request #444).
+- Reduced the chance of a dirt edge strip across a parking lot's asphalt along its aisles.
+- Reduced the chance of a suspension or cable-stayed bridge's tower leg standing in the lanes of the other direction
+  (jonathonbarton's pull request #441).
+- **Reduced the chance of tunnel entrances blocked by the hillside** (GitHub #403, Malibu Canyon Road's tunnel in
+  California): where a road was cut into a cliff right at a tunnel's mouth, wedges of ground stood across the
+  opening from the road up to the roof. The ground is now cut away wherever it reaches into the opening. Pittsburgh's
+  Fort Pitt Tunnel's upper portal was nearly closed the same way and is open now.
+- **Fewer street lamps at interchanges in the countryside** (TGForever Discord): every ramp was lit end to end, even
+  out in Wyoming. A ramp out of town now has lamps only where it leaves the highway and where it meets the road at its
+  end, as most rural interchanges are lit; ramps in towns and cities stay lit along their length.
+- **Smoother banked curves** (TGForever Discord: "a series of bumps where the bank would be"): the map draws a curve
+  as straight pieces that turn every few hundred feet, and the bank came and went at each turn. Curves now lean
+  evenly from start to end, easing in and out over about 200 ft.
+- **Faster first visits on slower connections** (GitHub #241): the ground under the car read the elevation along
+  each river and stream one after another, a trip to the elevation server each; it now asks for all of them at once.
+  On a Windows PC on Wi-Fi a new town's rivers came in about twice as fast.
+- **A slow internet connection is named as such** (GitHub #241): when the map data comes in very slowly, the status
+  line says so ("slow internet connection: new places take a few minutes to load") instead of looking stuck.
+- **Roads build faster**: the roads, bridges and props around you take about a quarter less computer time to build
+  (more of the server's work now runs in its fast native code).
+- **Reduced the chance of roads taking minutes on PCs with few cores** (GitHub #412): after a teleport the app lends
+  the game's spare cores to the world builder while you wait; driving off ended that at once, even with no roads
+  built yet. It now lasts until the roads around you are there (two minutes at most).
+- **Fewer city-sized roofs** (GitHub #413): a mapping error drew one "building" over a whole city in Egypt, its
+  concrete roof over every street. Footprints larger than any real building (about 0.8 square miles) are now left out.
+- **Fewer power-line towers on the road** (TGForever Discord): where a mapped tower sat on a highway's shoulder, the
+  tower now stands just off the road.
+- **A quieter console** (GitHub #391): "bridge clearance below 6.0 m target" no longer fills the app's window.
+
+Questions, bugs or just want to chat? Join the TGForever Discord: https://discord.gg/tgf
+
 ## 1.7.0 beta (2026-10-27)
 
 > **Join the TGForever Discord, [discord.gg/tgf](https://discord.gg/tgf), to chat, get help, report bugs or help

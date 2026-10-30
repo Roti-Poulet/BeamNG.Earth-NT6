@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import geodesy  # noqa: E402
 import gradesep  # noqa: E402
 
-gradesep.ON = True      # (off by default: these test the rule itself)
+gradesep.ON = gradesep.TUNNELS = True      # (only the tunnels by default: these test the whole rule)
 import mapcells  # noqa: E402
 import roads  # noqa: E402
 from test_roads import LAT, LON, features  # noqa: E402
@@ -84,11 +84,38 @@ class HeightsTest(unittest.TestCase):
         self.assertEqual([k for _, _, k in roads.level_ranges(f, 0)], ["tunnel"])
 
     def test_off(self):
-        gradesep.ON = False
+        gradesep.ON = gradesep.TUNNELS = False
         try:
             self.assertEqual(roads.level_ranges(hooked(cross(), embankment), 0), [])
+            f = hooked(cross(("motorway", "secondary"), flags=[(1, "is_tunnel", 0.45, 0.55)]),
+                       lambda e, n: np.zeros_like(e))
+            self.assertEqual(roads.level_ranges(f, 0), [])
         finally:
-            gradesep.ON = True
+            gradesep.ON = gradesep.TUNNELS = True
+
+
+class TunnelsOnlyTest(unittest.TestCase):
+    """The default: only the lines over a short tunnel; a cell with no such tunnel reads no neighbour."""
+
+    def setUp(self):
+        gradesep.ON = False
+
+    def tearDown(self):
+        gradesep.ON = True
+
+    def test_an_underpass_still_gets_its_bridge(self):
+        f = hooked(cross(("motorway", "secondary"), flags=[(1, "is_tunnel", 0.45, 0.55)]), lambda e, n: np.zeros_like(e))
+        self.assertEqual([k for _, _, k in roads.level_ranges(f, 0)], ["bridge"])
+        self.assertEqual(roads.level_ranges(f, 1), [])
+
+    def test_heights_alone_give_none_and_no_neighbour_is_read(self):
+        md = FakeMd(embankment)
+        asked = []
+        md.cell = lambda key, layers=(), kind="demand": asked.append(key)
+        f = cross()
+        f.__dict__["_bnge_gradesep"] = gradesep.hook(md, KEY)
+        self.assertEqual(roads.level_ranges(f, 0), [])
+        self.assertEqual(asked, [])
 
 
 class ShortTunnelTest(unittest.TestCase):

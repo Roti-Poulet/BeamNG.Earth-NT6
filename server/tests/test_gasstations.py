@@ -422,7 +422,8 @@ class LayoutTest(unittest.TestCase):
             self.assertTrue(inside_box(roof, a["x"], a["y"]), a)
 
     def test_no_room_no_site(self):
-        shop = rect("shop", 0.0, 13.0, 20.0, 10.0)          # 3 m between the road's edge and the shop
+        # (a kiosk's height: a canopy is taller, ONE_BLD_MIN_H_M, so the one-building rule leaves it a shop)
+        shop = rect("shop", 0.0, 13.0, 20.0, 10.0, height=3.5)          # 3 m between the road's edge and the shop
         st = gs.Station("st", 0.0, 13.0, "Shell", "Shell", ("p",), True)
         self.assertIsNone(gs.layout(st, [shop], ROAD))
 
@@ -459,6 +460,137 @@ class LayoutTest(unittest.TestCase):
             self.assertTrue(inside_box(roof, a["x"], a["y"], pad=1.5), a)
         # without the roof: the pumps at the pin, as before
         self.assertEqual(gs.layout(gs.Station("st", 0.0, 22.0, "Speedway", "", ("p",), True), [home], ROAD).drop_ids, ())
+
+    def test_station_mapped_as_one_building(self):
+        # (Japan: Tokyo laid out 0 of 20 stations, 2026-10-26) the whole station, canopy and office, mapped as one
+        # unclassed outline around its pin, a tight lot with no room for a pump pair: that outline is its canopy
+        st = gs.Station("en", 0.0, 17.0, "ENEOS", "ENEOS", ("p",), True)
+        bld = rect("bld", 0.0, 17.0, 20.0, 15.0)
+        tight = [rect("w", -16.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 16.0, 25.0, 10.0, 30.0, cls="apartments"),
+                 rect("n", 0.0, 35.0, 22.0, 6.0, cls="apartments")]
+        self.assertIsNone(gs._layout_core(st, [bld] + tight, ROAD), "nothing today")
+        site = gs.layout(st, [bld] + tight, ROAD)
+        self.assertIsNotNone(site)
+        self.assertEqual(site.drop_ids, ("bld",))
+        self.assertTrue(site.areas)
+        for a in site.areas:
+            self.assertTrue(inside_box(bld, a["x"], a["y"], pad=1.5), a)
+        # (Japanese names: a service station's SS, 石油; a Spanish one)
+        for name in ("千歳商会西新橋SS", "明光石油", "Gasolineria San Jeronimo"):
+            self.assertIsNotNone(gs.layout(gs.Station("x", 0.0, 17.0, name, "", ("p",), True), [bld] + tight, ROAD), name)
+
+    def test_one_building_with_an_office_beside_it(self):
+        st = gs.Station("en", 0.0, 17.0, "ENEOS", "ENEOS", ("p",), True)
+        bld = rect("bld", 0.0, 17.0, 20.0, 15.0)
+        office = rect("office", 0.0, 30.0, 8.0, 5.0)
+        tight = [rect("w", -16.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 16.0, 25.0, 10.0, 30.0, cls="apartments")]
+        self.assertIsNone(gs._layout_core(st, [bld, office] + tight, ROAD), "nothing today")
+        site = gs.layout(st, [bld, office] + tight, ROAD)
+        self.assertEqual(site.drop_ids, ("bld",))
+        self.assertEqual(site.shop_id, "office")
+        # (final review) a building farther off is no office of this station's: the station keyed by its own outline,
+        # so two stations near one block never hide each other (_one_per_shop)
+        far = rect("far", 0.0, 50.0, 8.0, 5.0)
+        site = gs.layout(st, [bld, far] + tight, ROAD)
+        self.assertEqual(site.shop_id, "bld:bld")
+
+    def test_one_building_pillars_off_the_sidewalk(self):
+        # (the user, 2026-10-27, Mexico City's two stations: "pillars on the side walks, it looks tacky") an outline of the
+        # whole station runs to the lot line at the back of the sidewalk: the canopy stands back from every side that
+        # faces a public road, so no pillar or roof edge is on the sidewalk
+        st = gs.Station("en", 0.0, 15.0, "ENEOS", "ENEOS", ("p",), True)
+        bld = rect("bld", 0.0, 15.0, 20.0, 15.0)            # front at y = 7.5: the road's edge at 5, a 2.5 m sidewalk
+        tight = [rect("w", -16.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 16.0, 25.0, 10.0, 30.0, cls="apartments")]
+        site = gs.layout(st, [bld] + tight, ROAD)
+        self.assertIsNotNone(site)
+        self.assertEqual(site.drop_ids, ("bld",))
+        pillars = [p for p in site.props if p["shape"] == gs._PILLAR]
+        self.assertTrue(pillars)
+        for p in pillars:
+            self.assertGreaterEqual(p["y"], 5.0 + gs.ONE_BLD_CLEAR_M - 0.01, p)     # (the road's edge at y = 5)
+        roof = next(p for p in site.props if p["shape"] == gs._ROOF)
+        self.assertAlmostEqual(roof["yaw"] % 180.0, 0.0)          # (lanes along y: the slab unturned, its y half scale[1])
+        front = roof["y"] - roof["scale"][1] * gs.ROOF_HALF[1]
+        self.assertGreaterEqual(front, 7.5 + 1.0, roof)
+        # a side against a neighbour, not a road, keeps its place: the roof reaches the back (y = 22.5)
+        self.assertGreaterEqual(roof["y"] + roof["scale"][1] * gs.ROOF_HALF[1], 22.5)
+
+    def test_one_building_outline_to_the_kerb(self):
+        # (Gasolineria San Jeronimo, Mexico City, 2026-10-27: its outline drawn to the kerb, the sidewalk inside it, so
+        # 3 m in from the outline left its pillars on the sidewalk) the canopy is measured from the road's edge
+        st = gs.Station("sj", 0.0, 15.0, "Gasolineria San Jeronimo", "", ("p",), True)
+        bld = rect("bld", 0.0, 14.0, 22.0, 18.0)             # front at y = 5.0: on the road's edge
+        tight = [rect("w", -17.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 17.0, 25.0, 10.0, 30.0, cls="apartments")]
+        site = gs.layout(st, [bld] + tight, ROAD)
+        self.assertIsNotNone(site)
+        for p in site.props:
+            if p["shape"] in (gs._PILLAR, gs.BOLLARD):
+                self.assertGreaterEqual(p["y"], 5.0 + gs.ONE_BLD_CLEAR_M - 0.01, p)
+
+    def test_one_building_never_over_a_working_layout(self):
+        # a pin inside an unclassed shop with a mapped canopy beside it: laid out as before (the shop stays a building)
+        shop = rect("shop", 0.0, 45.0, 20.0, 18.0)
+        roof = rect("roof", 0.0, 22.0, 30.0, 21.0, cls="roof")
+        site = gs.layout(STATION, [shop, roof], ROAD)
+        self.assertEqual(site.drop_ids, ("roof",))
+        self.assertEqual(site.shop_id, "shop")
+
+    def test_one_building_limits(self):
+        st = gs.Station("en", 0.0, 25.0, "ENEOS", "ENEOS", ("p",), True)
+        tight = [rect("w", -26.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 26.0, 25.0, 10.0, 30.0, cls="apartments")]
+        ring = np.array([(-10.0, 17.5), (10.0, 17.5), (10.0, 20.0), (-7.5, 20.0), (-7.5, 32.5), (-10.0, 32.5), (-10.0, 17.5)])
+        for why, b in (("too big", rect("b", 0.0, 25.0, 40.0, 30.0)),
+                       ("too tall", rect("b", 0.0, 25.0, 20.0, 15.0, height=18.0)),
+                       ("too low: a kiosk", rect("b", 0.0, 25.0, 20.0, 15.0, height=3.1)),
+                       ("a home", rect("b", 0.0, 25.0, 20.0, 15.0, cls="residential")),
+                       ("a shop class", rect("b", 0.0, 25.0, 20.0, 15.0, cls="retail")),
+                       ("named as something else", rect("b", 0.0, 25.0, 20.0, 15.0, name="McDonald's")),
+                       ("a car wash", rect("b", 0.0, 25.0, 20.0, 15.0, name="Car Wash")),
+                       ("an L, not a canopy", gs.Bld("b", ring, "", "", "OpenStreetMap", None)),
+                       ("the pin 5 m outside", rect("b", 0.0, 37.5, 20.0, 15.0))):
+            self.assertIsNone(gs._one_building_site(st, [b] + tight, ROAD), why)
+        bld = rect("b", 0.0, 25.0, 20.0, 15.0)
+        self.assertIsNotNone(gs._one_building_site(st, [bld] + tight, ROAD), "the control")
+        # a convenience brand alone, and a place wrongly in the gas station category (a post office, a land company)
+        for s in (gs.Station("w", 0.0, 25.0, "7-Eleven", "7-Eleven", ("p",), False),
+                  gs.Station("p", 0.0, 25.0, "Servicio Postal Mexicano", "", ("p",), True),
+                  gs.Station("h", 0.0, 25.0, "H&m Land And Minerals", "", ("p",), True),
+                  gs.Station("u", 0.0, 25.0, "Sind Ofs Elet Trab IND Inst e Manut Elet Gas Hidr", "", ("p",), True)):
+            self.assertIsNone(gs._one_building_site(s, [bld] + tight, ROAD), s.name)
+
+    def test_one_building_needs_a_trusted_station(self):
+        # (the user, 2026-10-27, a Google Maps view of Ginza 8-chome: an office block, "I dont think that is a gas
+        # station") a single old listing (Meta, 0.77: Showa Shell Shinbashi, a brand gone since 2023) put a station in
+        # an office: with no mapped canopy to confirm it, a building around the pin needs a record that is current
+        mk = lambda pid, conf, src: gs.Pin(pid, 0.0, 15.0, "ENEOS", "ENEOS", "", True, False, False, conf, src)
+        self.assertFalse(gs.merge([mk("a", 0.77, "meta")])[0].trusted, "one listing under TRUST_CONF")
+        self.assertTrue(gs.merge([mk("a", 0.95, "meta")])[0].trusted, "a confident one")
+        self.assertTrue(gs.merge([mk("a", 0.80, "AllThePlaces")])[0].trusted, "a brand's own store finder")
+        b = gs.Pin("b", 5.0, 15.0, "ENEOS", "ENEOS", "", True, False, False, 0.6, "Foursquare")
+        self.assertTrue(gs.merge([mk("a", 0.77, "meta"), b])[0].trusted, "two sources")
+        st = gs.Station("en", 0.0, 17.0, "ENEOS", "ENEOS", ("p",), True, False)
+        bld = rect("bld", 0.0, 17.0, 20.0, 15.0)
+        tight = [rect("w", -16.0, 25.0, 10.0, 30.0, cls="apartments"), rect("e", 16.0, 25.0, 10.0, 30.0, cls="apartments")]
+        self.assertIsNone(gs._one_building_site(st, [bld] + tight, ROAD), "untrusted: no canopy over an office")
+        self.assertIsNotNone(gs._one_building_site(gs.Station("en", 0.0, 17.0, "ENEOS", "ENEOS", ("p",), True, True),
+                                                   [bld] + tight, ROAD))
+
+    def test_fuel_named(self):
+        for t in ("Pemex", "BR", "Ipiranga", "Gasolineria San Jeronimo", "ENEOS Dr.Drive 梅田店", "Jx日鉱日石リテールサービス",
+                  "北海道エネルギー 札幌大通Ss", "西新橋SS", "Agip Service-Station", "Esso", "Posto de Gasolina Ruckert"):
+            self.assertTrue(gs._fuel_named(t), t)
+        for t in ("Servicio Postal Mexicano", "H&m Land And Minerals", "fuel2U", "McDonald's", "Business Services",
+                  "Shellfish Bar", "Sind Ofs Elet Trab IND Inst e Manut Elet Gas Hidr", "", None):
+            self.assertFalse(gs._fuel_named(t), t)
+        # (the user, 2026-10-27: "it needs to work for around the world, we have players in Russia all over Europe")
+        for t in ("Лукойл", "АЗС №12", "Роснефть", "Газпромнефть", "Татнефть", "Заправка", "ORLEN", "MOL", "Circle K",
+                  "Neste", "OKQ8", "Preem", "St1", "Uno-X", "Petrom", "Rompetrol", "Slovnaft", "Benzina", "INA",
+                  "Petrol Ofisi", "Opet", "Tamoil", "WOG", "OKKO", "SOCAR", "čerpací stanice", "huoltoasema", "bensinstasjon",
+                  "Πρατήριο καυσίμων", "akaryakıt istasyonu", "stacja paliw Lotos", "benzinkút", "ÖMV", "Q8", "Teboil",
+                  "Α.Π. Βενζινάδικο", "Jetoil", "Silkoil", "Elin", "Ελιν", "EKO", "Aegean", "Revoil", "PRIO", "Retitalia"):
+            self.assertTrue(gs._fuel_named(t), t)
+        for t in ("Почта России", "Molly's Pub", "Inazuma", "Circle Kitchen", "Renault", "Garagem Manique", "Neste Oyj headquarters office"[:4] + "rov"):
+            self.assertFalse(gs._fuel_named(t), t)
 
     def test_no_shop_no_site(self):
         st = gs.Station("st", 0.0, 200.0, "Shell", "Shell", ("p",), True)
@@ -1112,6 +1244,21 @@ class SwitchTest(unittest.TestCase):
         s.set_gas_stations(False)                                             # the switch: every block's photo again
         self.assertEqual(s.base_stale, {(a.id, 0.0, 0.0), (a.id, 5 * size, 0.0)})
 
+    def test_pads_during_a_block_build_mark_it(self):
+        # (the user, 2026-10-27: "if you teleport to a station with the map, the gas station lot never gets painted")
+        # after a teleport the station's road tile brought its pad 0.1 s before the block under the car finished: that
+        # block's build had taken the pads of its start (none), and it was not in hm yet, so nothing marked it
+        s, sur = self.server(gas_stations=True, near_visual="detail")
+        a = s.new_anchor(40.0, -80.0)
+        s.anchors[a.id] = a
+        key = (a.id, 0.0, 0.0)
+        s.hm_stage[key] = "the block process"                               # (being built)
+        la, lo, _ = a.frame.enu_to_geodetic(np.array([-10.0, 10.0, 10.0, -10.0]), np.array([-5.0, -5.0, 5.0, 5.0]),
+                                            np.zeros(4))
+        s.keep_fuel_pads([("st", [(np.asarray(la), np.asarray(lo))])])
+        self.assertIn(key, s.pads_rebuild, "built again once it is done")
+        self.assertIn(key, s.base_stale)
+
     def test_new_pads_rebuild_the_block_when_slow(self):
         # the photo alone left the forecourt grass and dirt underneath (the user, 2026-10-24: "looks like we painted it
         # but it is still dirt"): the surface layers come with the block, so the block the car is on is built again
@@ -1170,7 +1317,7 @@ class SwitchTest(unittest.TestCase):
 REAL = __import__("os").environ.get("BNGE_GAS_REAL") == "1"
 
 
-@unittest.skipUnless(REAL, "set BNGE_GAS_REAL=1 to lay out three Pittsburgh-area stations from the real Overture data")
+@unittest.skipUnless(REAL, "set BNGE_GAS_REAL=1 to lay out real stations (Pittsburgh area, Nagambie, Tokyo) from the Overture data")
 class RealSpotsTest(unittest.TestCase):
     """Real stations around Pittsburgh, one per kind of canopy data (picked 2026-10-23 from the stations laid out in
     and around the city)."""
@@ -1217,6 +1364,14 @@ class RealSpotsTest(unittest.TestCase):
         rec, skip = self.site(-36.79432, 145.15094)
         self.assertEqual(len(skip), 1, "the OSM roof left out")
         self.assertTrue(any("s_fuel_structure_06" in p["shape"] for p in rec["props"]))
+
+    def test_one_building_japan(self):
+        # an ENEOS in Tokyo (2026-10-26): the whole station one unclassed 451 m2 outline around its pin
+        # (_one_building_site); before, Tokyo and Osaka laid out 0 of 20 stations
+        rec, skip = self.site(35.678616, 139.777064)
+        self.assertEqual(len(skip), 1, "the station's outline left out")
+        self.assertTrue(any("s_fuel_structure_06" in p["shape"] for p in rec["props"]))
+        self.assertGreaterEqual(len(rec["areas"]), 2)
 
 
 if __name__ == "__main__":

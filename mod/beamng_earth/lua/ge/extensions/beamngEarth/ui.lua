@@ -44,7 +44,7 @@ local function drawCompact(view)
     end
     if im.Button('Full window') then M.compact = false end
     im.SameLine()
-    text('Settings: pause menu > Mods > BeamNG.Earth')
+    text('Settings: pause menu > BeamNG.Earth')
   end
   im.End()
 end

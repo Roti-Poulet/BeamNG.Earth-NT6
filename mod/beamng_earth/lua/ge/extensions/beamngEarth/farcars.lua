@@ -100,7 +100,7 @@ end
 local function toXYZ(rec)
   local a = anchorOf()
   if not a then return nil end
-  return a:geodeticToEnu(rec.lat, rec.lon, rec.h)
+  return a:geodeticToWorld(rec.lat, rec.lon, rec.h)
 end
 
 -- Save vehicle veh; update takes it out (or, keep, hands it on to the switch) once its state file is written.
@@ -108,7 +108,7 @@ local function startSave(veh, keep)
   local a = anchorOf()
   if not a then return nil end
   local p = veh:getPosition()
-  local lat, lon, h = a:enuToGeodetic(p.x, p.y, p.z)
+  local lat, lon, h = a:worldToGeodetic(p.x, p.y, p.z)
   local q = quat(0, 0, 1, 0) * quat(veh:getRefNodeRotation())       -- (as core_vehicles' keepOtherVehRotation)
   serial = serial + 1
   local uid = string.format('%d_%d', os.time(), serial)

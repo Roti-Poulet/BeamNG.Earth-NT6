@@ -1,15 +1,33 @@
 import { lua } from "@/bridge"
 
-// BeamNG.Earth: a button in the shared "Mods" tab of the Pause Menu opening the settings page
-// (same pattern as the taa_standalone mod). Lua side: lua/ge/extensions/beamngEarth/settings.lua.
+// BeamNG.Earth: a tab of its own in the Pause Menu (the user, 2026-10-28: "its own tab in the pause menu like where
+// BeamMP puts it ... and have each page listed in the menu on the side"): ui_pause_actions.registerModTab, then one
+// side button per settings page (EarthSettingsPage.vue with that page; EarthSettingsSide.vue as the tab's second card).
+// The same pages as a full page of their own (EarthSettings.vue, a route: the main menu). Lua side:
+// lua/ge/extensions/beamngEarth/settings.lua.
 //
 // The world map (EarthMap.vue): a full-screen route of its own ("beamngEarthMap", opened by the
-// map key (M, the pause menu Map, or a bound key) through beamngEarth_settings.toggleMap). No Mods-tab button of its own
+// map key (M, the pause menu Map, or a bound key) through beamngEarth_settings.toggleMap). No pause-menu button of its own
 // (the user, 2026-10-16: "move the map out of the mods tab"; the stock Map entry opens it). The route follows ui/ui-vue/mods/README.md "Standalone routes"; any failure
-// there is logged and leaves the settings button alone.
+// there is logged and leaves the settings tab alone.
+const TAB_ID = "beamngEarth"
+const MOD_ROOT = "/ui/ui-vue/mods/beamngEarth"
 const MAP_SOURCE = "beamngEarth.routes"
-function mapRoutes(EarthMap, EarthWelcome) {
+function mapRoutes(EarthMap, EarthWelcome, EarthSettings) {
   return [
+  {
+    // the full settings page (the user, 2026-10-28: "a whole separate page like how BeamMP's settings page is"):
+    // the main menu's way in (beamngEarth_settings.openSettings); in a level the pause menu's tab has the same pages
+    path: "/beamng-earth-settings",
+    name: "beamngEarthSettings",
+    component: EarthSettings,
+    meta: {
+      luaRoute: {
+        title: "BeamNG.Earth settings",
+        backTarget: "menu",
+      },
+    },
+  },
   {
     // the one-time welcome (settings.lua shows it once per WELCOME_VERSION in our level)
     path: "/beamng-earth-welcome",
@@ -40,11 +58,37 @@ function toLuaRoutes(records) {
   return records.map(record => ({ name: record.name, path: record.path, meta: record.meta }))
 }
 
+// The pause menu's BeamNG.Earth tab: the tab first (its buttons need it), then a side button per settings page
+async function registerPauseTab() {
+  try {
+    const store = await import("./earthSettingsStore.js")
+    await lua.extensions.ui_pause_actions.registerModTab({
+      id: TAB_ID,
+      label: "BeamNG.Earth",
+      icon: "globe",
+      card2ComponentName: `${MOD_ROOT}/EarthSettingsSide.vue`,
+    })
+    for (const [i, page] of store.settingsSchema.entries()) {
+      await lua.extensions.ui_pause_actions.registerModButton({
+        id: store.pageId(page.name, i),
+        tabId: TAB_ID,
+        label: page.name,
+        icon: store.PAGE_ICONS[page.name] || "cogOutline",
+        componentName: `${MOD_ROOT}/EarthSettingsPage.vue`,
+        props: { page: page.name },
+      })
+    }
+  } catch (e) {
+    console.error("BeamNG.Earth: pause menu tab failed", e)
+  }
+}
+
 async function registerMapRoute() {
   try {
     if (!window.bngRoutes || !lua.extensions.ui_router_routeManager) return
     // imported here, not at the top: a map that fails to compile must not cost the settings button
-    const routes = mapRoutes((await import("./EarthMap.vue")).default, (await import("./EarthWelcome.vue")).default)
+    const routes = mapRoutes((await import("./EarthMap.vue")).default, (await import("./EarthWelcome.vue")).default,
+                             (await import("./EarthSettings.vue")).default)
     window.bngRoutes.add([{ path: MAP_SOURCE, routes }])
     const result = await lua.extensions.ui_router_routeManager.registerModRoutes(MAP_SOURCE, toLuaRoutes(routes))
     if (!result?.success) {
@@ -57,13 +101,9 @@ async function registerMapRoute() {
 }
 
 export async function onLoad() {
-  await lua.extensions.ui_pause_actions.registerModButton({
-    id: "beamngEarth-settings",
-    tabId: "mods",
-    label: "BeamNG.Earth",
-    icon: "globe",
-    componentName: "/ui/ui-vue/mods/beamngEarth/EarthSettings.vue",
-  })
+  // the old shared-Mods-tab button, if this UI session still has one (before the tab: its id is the first page's)
+  try { await lua.extensions.ui_pause_actions.unregisterModButton("beamngEarth-settings") } catch (e) { /* none */ }
+  await registerPauseTab()
   // tell the mod the page exists: its imgui window becomes a compact HUD (settings.lua)
   if (window.bngApi && window.bngApi.engineLua) {
     window.bngApi.engineLua("if beamngEarth_settings then beamngEarth_settings.setPageExists(true) end")
@@ -77,7 +117,7 @@ export async function onLoad() {
 
 export async function onUnload() {
   try { (await import("./earthServers.js")).stop() } catch (e) { /* never started */ }
-  await lua.extensions.ui_pause_actions.unregisterModButton("beamngEarth-settings")
+  await lua.extensions.ui_pause_actions.unregisterModTab(TAB_ID)       // (its buttons with it)
   try {
     if (window.bngRoutes) window.bngRoutes.remove([MAP_SOURCE])
     if (lua.extensions.ui_router_routeManager) {

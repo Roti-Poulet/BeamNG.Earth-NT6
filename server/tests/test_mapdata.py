@@ -33,6 +33,9 @@ import netfetch  # noqa: E402
 import overture  # noqa: E402
 import rangeread  # noqa: E402
 import xproc  # noqa: E402
+import railtags  # noqa: E402
+
+railtags.LANES_ON = False       # (the lane shards are fetched per build: test_railtags; these count Overture's requests)
 
 try:
     import duckdb  # noqa: F401 (only whether it is installed)

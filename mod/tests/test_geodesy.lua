@@ -215,4 +215,34 @@ do -- teleport anchors on their grid (snapAnchor): the same cell, the same ancho
   T.check(la == 88.5 and lo == 12.345, 'not snapped near the poles')
 end
 
+-- The world's convention: x, y of a place at h = 0, z at its height; lat / lon from x, y alone (US-163, Utah,
+-- 2026-10-29: 13 km out at 1650 m the road lay 2-3 m from where a z-aware conversion put it)
+do
+  local anc = g.newAnchor(37.0, -110.18)
+  local x0, y0 = anc:geodeticToEnu(37.067991, -110.058199, 0)
+  local x, y, z = anc:geodeticToWorld(37.067991, -110.058199, 1650)
+  T.near(x, x0, 1e-6, 'world x is the h = 0 point'); T.near(y, y0, 1e-6, 'world y is the h = 0 point')
+  local _, _, u = anc:geodeticToEnu(37.067991, -110.058199, 1650)
+  T.near(z, u, 1e-6, 'world z is the point at its height')
+  local xz, yz = anc:geodeticToEnu(37.067991, -110.058199, 1650)
+  T.check(math.abs(xz - x) > 2, 'the z-aware point is metres off out there (' .. (xz - x) .. ')')
+  local lat, lon, h = anc:worldToGeodetic(x, y, z)
+  -- (lat / lon of the plane point (x, y, 0), as the server's ground samples: a few cm from the h = 0 point's)
+  T.near(lat, 37.067991, 1e-6, 'world -> lat'); T.near(lon, -110.058199, 1e-6, 'world -> lon')
+  T.near(h, 1650, 0.05, 'world -> h')
+end
+
+-- A rebase on a plateau: the spot under the car lands where the new anchor's world puts it (the rigid move: metres off)
+do
+  local a, b = g.newAnchor(37.0, -110.18), g.newAnchor(37.07, -110.06)
+  local x, y, z = a:geodeticToWorld(37.067991, -110.058199, 1650)
+  local wx, wy, wz = b:geodeticToWorld(37.067991, -110.058199, 1650)
+  local rx, ry = a:transformTo(b):apply(x, y, z)
+  T.check(math.abs(rx - wx) + math.abs(ry - wy) > 1, 'the rigid move misses the new world (' .. (rx - wx) .. ', ' .. (ry - wy) .. ')')
+  local nx, ny, nz = a:worldTransformTo(b, x, y, z):apply(x, y, z)
+  T.near(nx, wx, 0.05, 'corrected x'); T.near(ny, wy, 0.05, 'corrected y'); T.near(nz, wz, 0.05, 'corrected z')
+  local same = a:worldTransformTo(a, x, y, z)
+  T.near(math.abs(same.t[1]) + math.abs(same.t[2]) + math.abs(same.t[3]), 0, 1e-9, 'same anchor: identity')
+end
+
 T.done('test_geodesy')

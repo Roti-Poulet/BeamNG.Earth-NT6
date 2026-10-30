@@ -34,7 +34,7 @@ import staging
 
 log = logging.getLogger("earthd.seacarve")
 
-VERSION = 19
+VERSION = 20                # (20: no river beds carved along underground rivers, riverlines.underground)
 SEA_E = 0.0                 # m: the sea surface (the DEMs' heights are above mean sea level)
 DEPTH_SLOPE = 0.15          # floor depth per metre from the shoreline (1 : 6.7)
 DEPTH_CAP = 6.0             # m: the floor's depth away from the shore without bathymetry (Chesapeake mean
@@ -521,16 +521,34 @@ class SeaCarver:
                 for i in np.flatnonzero(f.kind == 2):
                     kind = riverlines._kind(str(f.attrs["subtype"][i]), str(cls[i]))
                     gid = str(f.ids[i])
-                    if kind is None or bool(inter[i]) or gid in seen:
+                    if kind is None or bool(inter[i]) or gid in seen or riverlines.underground(f, i):
                         continue
                     seen.add(gid)
                     lines.append((gid, kind, [ring for part in f.parts(i) for ring in part]))
         lines.sort(key=lambda r: r[0])      # (in id order: the same whichever cell met a line first)
+        runs = []
         for _gid, kind, rings in lines:
             for ring in rings:
                 mx, my = _merc(ring[:, 1], ring[:, 0])
-                self._carve_line(np.stack([mx - ox, my - oy], -1), kind, ox, oy, n, px, depth, level,
-                                 held, drawn, o_dist)
+                runs.extend((q, kind) for q in self._line_runs(np.stack([mx - ox, my - oy], -1), n, px))
+        # every run's DEM probes in one sample (its tiles fetched at once): a run at a time was a network round trip
+        # each, ~40 s of a fresh place's first block on a slow line (Ostrava, a Windows PC on Wi-Fi, 2026-10-28)
+        probes = [self._run_probes(q, kind, n, px, o_dist, ox, oy) for q, kind in runs]
+        if probes:
+            la = np.concatenate([p[1] for p in probes])
+            lo = np.concatenate([p[2] for p in probes])
+            try:
+                e_all = np.asarray(self.dem.sample(la, lo, LAKE_DEM_ZOOM), np.float64)
+            except Exception as ex:
+                log.debug("stream levels: %s", ex)
+                e_all = None
+            k = 0
+            for (q, _kind), (w, pla, _plo) in zip(runs, probes):
+                m = len(pla)
+                if e_all is not None:
+                    self._carve_run(q, w, e_all[k:k + m].reshape(9, -1).min(axis=0), n, px, depth, level, held,
+                                    drawn)
+                k += m
         outline |= drawn
 
     def _river_line_px(self, x, y, ox, oy, n):
@@ -546,7 +564,8 @@ class SeaCarver:
                 cls = f.attrs.get("class", np.full(len(f.kind), "", object))
                 for i in np.flatnonzero(f.kind == 2):
                     gid = str(f.ids[i])
-                    if gid in seen or riverlines._kind(str(f.attrs["subtype"][i]), str(cls[i])) != "river":
+                    if gid in seen or riverlines._kind(str(f.attrs["subtype"][i]), str(cls[i])) != "river" \
+                            or riverlines.underground(f, i):
                         continue
                     seen.add(gid)
                     for part in f.parts(i):
@@ -564,16 +583,17 @@ class SeaCarver:
                             out[jj[ok], ii[ok]] = True
         return out
 
-    def _carve_line(self, pts, kind, ox, oy, n, px, depth, level, held, drawn, o_dist):
+    def _line_runs(self, pts, n, px):
+        """The sample runs (each (k, 2) pixel points) of a line pts that can reach the raster (_carve_run's)."""
         import riverlines
         wmax = riverlines.WIDTH_MAX_M / px
-        if (pts[:, 0].max() < -wmax or pts[:, 1].max() < -wmax or pts[:, 0].min() > n + wmax
-                or pts[:, 1].min() > n + wmax or len(pts) < 2):
-            return
+        if (len(pts) < 2 or pts[:, 0].max() < -wmax or pts[:, 1].max() < -wmax or pts[:, 0].min() > n + wmax
+                or pts[:, 1].min() > n + wmax):
+            return []
         seg = np.hypot(*np.diff(pts, axis=0).T)
         s = np.r_[0.0, np.cumsum(seg)]
         if s[-1] <= 0:
-            return
+            return []
         t = np.linspace(0.0, s[-1], max(2, int(math.ceil(s[-1] / LINE_STEP_PX)) + 1))
         q = np.stack([np.interp(t, s, pts[:, 0]), np.interp(t, s, pts[:, 1])], -1)
         # only the samples whose channel and bank can reach the raster, and one either side (their segments): each
@@ -582,19 +602,18 @@ class SeaCarver:
         m = wmax + LINE_BANK_M / px + 2 * LINE_STEP_PX
         near = (q[:, 0] >= -m) & (q[:, 0] <= n + m) & (q[:, 1] >= -m) & (q[:, 1] <= n + m)
         if not near.any():
-            return
-        if not near.all():
-            keep = near.copy()
-            keep[:-1] |= near[1:]
-            keep[1:] |= near[:-1]
-            runs = np.flatnonzero(np.diff(np.r_[0, keep.astype(np.int8), 0]))
-            for a, b in zip(runs[::2], runs[1::2]):
-                if b - a >= 2:
-                    self._carve_run(q[a:b], kind, n, px, depth, level, held, drawn, o_dist, ox, oy)
-            return
-        self._carve_run(q, kind, n, px, depth, level, held, drawn, o_dist, ox, oy)
+            return []
+        if near.all():
+            return [q]
+        keep = near.copy()
+        keep[:-1] |= near[1:]
+        keep[1:] |= near[:-1]
+        runs = np.flatnonzero(np.diff(np.r_[0, keep.astype(np.int8), 0]))
+        return [q[a:b] for a, b in zip(runs[::2], runs[1::2]) if b - a >= 2]
 
-    def _carve_run(self, q, kind, n, px, depth, level, held, drawn, o_dist, ox, oy):
+    def _run_probes(self, q, kind, n, px, o_dist, ox, oy):
+        """(w, la, lo): a run's widths (m) and its DEM probes (the point and 8 around it at half the width,
+        <= LINE_PROBE_MAX_M), 9 blocks of len(q)."""
         import riverlines
         w = np.full(len(q), riverlines.WIDTH_M[kind])
         if o_dist is not None:          # in an outline: twice the distance to its edge
@@ -609,11 +628,11 @@ class SeaCarver:
         pxs = np.concatenate([q[:, 0]] + [q[:, 0] + r * math.cos(a) for a in ang])
         pys = np.concatenate([q[:, 1]] + [q[:, 1] + r * math.sin(a) for a in ang])
         la, lo = _lonlat(ox + pxs + 0.5, oy + pys + 0.5)
-        try:
-            e = np.asarray(self.dem.sample(la, lo, LAKE_DEM_ZOOM), np.float64).reshape(9, -1).min(axis=0)
-        except Exception as ex:
-            log.debug("stream levels: %s", ex)
-            return
+        return w, np.asarray(la, np.float64), np.asarray(lo, np.float64)
+
+    def _carve_run(self, q, w, e, n, px, depth, level, held, drawn):
+        """One run carved (Rust: earthfast.carve_segments): q its points, w their widths (m), e the lowest DEM of
+        their probes (_run_probes)."""
         lv = np.round(e / LEVEL_Q) * LEVEL_Q
         hw = w / 2 / px
         D = np.clip(w / 6.0, *LINE_DEPTH_M)
@@ -1019,7 +1038,9 @@ def shore_plan(frame, x, y, carver, radius=SHORE_RADIUS_M):
             later.append((cx, cy))
             continue
         for n, (kind, lv, la, lo) in enumerate(cell_shores(carver, cx, cy)):
-            e, nn, z = frame.geodetic_to_enu(la, lo, np.full(len(la), lv))
+            # (east / north at h = 0 as the carved ground's samples, up at the water's level: roads.build_tile)
+            e, nn, _ = frame.geodetic_to_enu(la, lo, 0.0)
+            z = frame.geodetic_to_enu(la, lo, np.full(len(la), lv))[2]
             nodes = [[round(float(a), 1), round(float(b), 1), round(float(c), 2)] for a, b, c in zip(e, nn, z)]
             h = hashlib.sha1(repr(nodes).encode()).hexdigest()[:8]
             out.append([f"S{cx}_{cy}_{n}_{h}", kind, nodes])

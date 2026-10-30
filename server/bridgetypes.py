@@ -259,9 +259,40 @@ def nav_clearance(frame, lines):
     if "nav" not in db:
         return 0.0
     for _, i in matches(frame, lines):
-        if db["nav"][i] > 0:
+        if db["nav"][i] > 0 and nav_plausible(float(db["nav"][i]), float(db["span"][i]), int(db["type"][i])):
             return float(db["nav"][i])
     return 0.0
+
+
+def nav_span(frame, lines):
+    """m: the main span (NBI item 48) of the record nav_clearance takes its clearance from, 0 if none: the channel
+    that clearance holds over."""
+    db = _load()
+    if "nav" not in db:
+        return 0.0
+    for _, i in matches(frame, lines):
+        if db["nav"][i] > 0 and nav_plausible(float(db["nav"][i]), float(db["span"][i]), int(db["type"][i])):
+            return float(db["span"][i])
+    return 0.0
+
+
+NAV_SPAN_MIN = 0.06         # a navigation clearance under this share of the record's main span (15 m at most) is not ...
+NAV_SPAN_MAX_MOVABLE = 0.30  # ... and a movable bridge's over this share is its span raised
+MOVABLE = (15, 16, 17)       # NBI 43B: lift, bascule, swing
+
+
+def nav_plausible(nav, span, kind):
+    """Whether NBI item 39 (m) fits the closed bridge: 3-80 m; for a main span of 40 m or more, at least
+    min(NAV_SPAN_MIN x span, 15 m); a movable one's at most NAV_SPAN_MAX_MOVABLE x span. Portland, 2026-10-19: the
+    Interstate Bridge's 4.3 m under a 162 m lift span (its deck is 22 m up), the Hawthorne Bridge's 33.5 m (the
+    lift span raised) over 74 m; the Golden Gate Bridge's 67 m over its 1280 m span stays. Pure."""
+    if not 3.0 <= nav <= 80.0:
+        return False
+    if span < 40.0:
+        return True
+    if kind in MOVABLE and nav > NAV_SPAN_MAX_MOVABLE * span:
+        return False
+    return nav >= min(NAV_SPAN_MIN * span, 15.0)
 
 
 def record(i):
@@ -326,19 +357,32 @@ def chain_structures(frame, parts, wet_fn=None, infra=()):
             wd_agrees = code in (0, PLAIN) or _family(code) == _family(wdr["type"])
             if wd_agrees and not (wdr["type"] == ARCH_ANY and code in (NBI_DECK_ARCH, NBI_THROUGH_ARCH)):
                 code = wdr["type"]          # (an arch the map places over or under its deck keeps that)
-        if code in (0, PLAIN):
-            continue                        # a plain kind: nothing drawn there
+        tagged = code
         inner = [ln[_in_rings(rings, ln)] for ln in lines]
         found = matches(frame, [ln for ln in inner if len(ln) >= 2])
         if not found:                       # (the record's point can lie outside the outline: Golden Gate's)
             found = matches(frame, [ln for ln in lines if _in_rings(rings, ln).any()])
+        if found and found[0][1] in used and int(_load()["type"][found[0][1]]) in MOVABLE_TYPES:
+            continue                        # (a movable bridge's other outlines: one structure, the Burnside's three)
+        nbi_t = int(_load()["type"][found[0][1]]) if found else 0
+        code, shape = resolve_type(code, nbi_t, tags)
+        if code in (0, PLAIN):
+            continue                        # a plain kind: nothing drawn there
         info = ({**record(found[0][1]), "src": "osm+nbi"} if found else
                 {"span": 0.0, "length": 0.0, "width": 0.0, "src": "osm"})
+        if shape:
+            info["shape"] = shape
+        if tagged in TRUSS_TYPES or shape == "arched" or str(tags.get("bridge:structure")) in ("truss", "cantilever"):
+            info["truss"] = True            # (a movable span the map or Wikidata calls a truss: steel over it)
         if found:
             used.add(found[0][1])
         elif wdr is not None and wdr["span"] > 0 and wd_agrees:
             info.update(span=wdr["span"], length=wdr["length"], src="osm+wd")
         info.update(type=code, paint=paint(tags.get("colour")) or (wdr or {}).get("wd_paint") or "grey", outline=rings)
+        if found and (code in MOVABLE_TYPES or shape) and _held(rings, lines) < 0.5 * float(info["length"]):
+            # an outline holding a small part of the inventory's bridge (the Hawthorne Bridge's: its east end) does not
+            # bound its trusses: the record's circle does (the river spans: truss_members keeps them to the water)
+            info["outline"] = rings + [_circle(frame, found[0][1])]
         out.append(info)
         osm_sites.append((np.concatenate(rings).mean(0), max(float(info["length"]), 300.0)))
     chain_paint = (osm_colour(frame, parts, infra) if infra else None) or "grey"
@@ -379,7 +423,7 @@ def chain_structures(frame, parts, wet_fn=None, infra=()):
             continue                        # a girder bridge: a plain deck (and no size rule there)
         out.append({**r, "src": "wd", "paint": r.get("wd_paint") or chain_paint, "outline": circle})
     if out or taken:
-        return out
+        return _drop_strays(out)
     pts = np.concatenate(lines)
     cc = pts.mean(0)
     la, lo, _ = frame.enu_to_geodetic(np.array([cc[0]]), np.array([cc[1]]), 0.0)
@@ -391,6 +435,71 @@ def chain_structures(frame, parts, wet_fn=None, infra=()):
         return [{"type": NBI_THROUGH_TRUSS, "span": float(min(longest, 250.0)), "length": 0.0, "width": 0.0,
                  "src": "size", "paint": chain_paint}]
     return []
+
+
+MOVABLE_TYPES = (NBI_LIFT, NBI_BASCULE, NBI_SWING)
+LENS_TAGS = ("lenticular", "lens", "pauli")       # OSM bridge:truss / truss:type values of a lens truss
+
+
+def resolve_type(code, nbi_t, tags=None):
+    """(type code, shape None | "lens" | "arched") of a bridge from the map's / Wikidata's code and its inventory record's
+    type nbi_t (0: none). The inventory knows what moves: a bascule or lift span the map tags `arch` (Portland's
+    Broadway Bridge, a bascule between curved-chord Petit trusses) or `beam` was drawn as an arch hanging under its
+    road (the user's screenshots, 2026-10-26), so a movable record decides the type; the arch tag then says the
+    truss's top chord is curved. A truss record the map or Wikidata calls an arch is a lens truss (Pittsburgh's
+    Smithfield Street Bridge: Wikidata's arch, the inventory's through truss), as is one tagged bridge:truss=lenticular.
+    Pure."""
+    tags = tags or {}
+    lens_tag = any(str(tags.get(k, "")).lower() in LENS_TAGS for k in ("bridge:truss", "truss:type", "truss"))
+    archy = code in (ARCH_ANY, NBI_DECK_ARCH, NBI_THROUGH_ARCH)
+    if nbi_t in MOVABLE_TYPES and code not in (NBI_SUSPENSION, NBI_STAYED):
+        return nbi_t, ("arched" if archy else None)
+    if code in MOVABLE_TYPES:
+        return code, None
+    if nbi_t in TRUSS_TYPES and (code == ARCH_ANY or lens_tag):
+        return NBI_THROUGH_TRUSS, "lens"
+    if code in TRUSS_TYPES and lens_tag:
+        return NBI_THROUGH_TRUSS, "lens"
+    return code, None
+
+
+def _held(rings, lines):
+    """m of the deck line holding most inside the rings (decks side by side count once)."""
+    held = 0.0
+    for ln in lines:
+        m = _in_rings(rings, ln)
+        held = max(held, float(np.hypot(*np.diff(ln, axis=0).T)[m[1:] & m[:-1]].sum()))
+    return held
+
+
+def _circle(frame, i):
+    """The circle (33, 2) in the frame round inventory record i that chain_structures gives a record of its own."""
+    db = _load()
+    e, n, _ = frame.geodetic_to_enu(np.array([float(db["lat"][i])]), np.array([float(db["lon"][i])]), 0.0)
+    r = max(float(db["length"][i]) / 2, 100.0) + MATCH_M
+    ang = np.linspace(0, 2 * np.pi, 33)
+    return np.c_[float(e[0]) + r * np.cos(ang), float(n[0]) + r * np.sin(ang)]
+
+
+def _drop_strays(out):
+    """The structures of a chain without a second site of a kind that has no size from any source where one of the same
+    kind has one: a second outline of the Fremont Bridge (tagged arch, no record of its own) put a 40 m arch on an
+    approach ramp beside the real 383 m one (2026-10-27)."""
+    sized = {_family(s["type"]) for s in out if s.get("span")}
+    out = [s for s in out if s.get("span") or _family(s["type"]) not in sized]
+    # one main span per site: an arch or a cable span from a record whose circle holds a bigger one's centre is the
+    # same crossing (the Fort Pitt Bridge's 229 m through arch got a 56 m deck arch drawn under it from a record of
+    # a ramp beside it, 2026-10-27; both go on the chain's one main span)
+    keep = []
+    for s in sorted(out, key=lambda s: -float(s.get("span") or 0)):
+        if s["type"] in ARCH_TYPES + (NBI_SUSPENSION, NBI_STAYED) and s.get("src") in ("nbi", "wd"):
+            c = np.asarray(s["outline"]).mean(0) if isinstance(s.get("outline"), np.ndarray) else None
+            if c is not None and any(k["type"] in ARCH_TYPES + (NBI_SUSPENSION, NBI_STAYED) and
+                                     isinstance(k.get("outline"), np.ndarray) and
+                                     _in_rings(k["outline"], c[None])[0] for k in keep):
+                continue
+        keep.append(s)
+    return [s for s in out if any(s is k for k in keep)]
 
 
 FAMILIES = {NBI_SUSPENSION: "cable", NBI_STAYED: "cable", NBI_DECK_ARCH: "arch", NBI_THROUGH_ARCH: "arch",
@@ -507,6 +616,104 @@ def _clear_of_roads(foot, road_lines, gap):
     return True
 
 
+SHAPED_ARM = 0.12       # (a lens / curved-chord / movable truss) this share of a span past the water
+LENS_RISE = 1 / 14.0    # a lens truss's top chord over its portals at mid-span: a share of its span (Smithfield
+                        # Street: 110 m spans, ~8 m)
+LENS_BELLY_M = 1.2      # ... its lower chord falls to this over the road at mid-span (BeamMaps' Smithfield)
+ARCHED_RISE = 1 / 12.0  # a curved-chord (Petit / Parker) truss's top chord rise over its ends: a share of its span
+PORTAL_M = 7.0          # m: a shaped through truss's ends (portals) over the road
+
+
+LOW_WATER_M = 2.0       # low_water: ground within this of a chain's lowest point is its river ...
+LOW_DIP_M = 5.0         # ... when that lies this far under both of its ends
+
+
+def low_water(P, ground_fn, inside=None):
+    """wet(xy) -> bool for a river the sea depth does not know (one above sea level: Pittsburgh's rivers, ~218 m; the
+    Willamette under Portland's bridges), or None: the ground within LOW_WATER_M of the lowest point under the chain's
+    part dipping deepest (inside the bridge's outline, else all of it), if that lies LOW_DIP_M under its higher end (the
+    Smithfield Street Bridge's outline stops over the low south bank; the Hawthorne Bridge's holds the river only).
+    Pure given ground_fn."""
+    for use in ((inside, None) if inside is not None else (None,)):
+        lines = [np.asarray(p[0], np.float64)[m] if use is not None else np.asarray(p[0], np.float64)
+                 for p, m in zip(P, use if use is not None else [None] * len(P))]
+        lines = [ln for ln in lines if len(ln) >= 2]
+        if not lines:
+            continue
+        best = None
+        for ln in lines:                                # the part dipping deepest between its ends: the crossing
+            g = np.asarray(ground_fn(ln), np.float64)
+            dip = max(g[0], g[-1]) - float(g.min())
+            if best is None or dip > best[0]:
+                best = (dip, float(g.min()))
+        if best[0] >= LOW_DIP_M:
+            lo = best[1]
+            return lambda xy: np.asarray(ground_fn(np.asarray(xy, np.float64)), np.float64) <= lo + LOW_WATER_M
+    return None
+
+
+def _span_axis(groups):
+    """(origin (2,), unit axis (2,), x0, x1): the line all of a structure's truss runs lie along (their stations'
+    principal direction) and their extent on it, so their spans fall in one place: the runs of the decks side by side
+    each took their own (three lenses over the Smithfield Street Bridge's two spans, 2026-10-27)."""
+    c = np.array([(L + R) / 2 for run in groups for L, R, *_ in run])
+    o = c.mean(0)
+    _, _, vt = np.linalg.svd(c - o, full_matrices=False)
+    ax = vt[0]
+    x = (c - o) @ ax
+    return o, ax, float(x.min()), float(x.max())
+
+
+def _spans_of(run, span, axis):
+    """Per station of a truss run: (span index, t 0..1 along that span, kept). The structure (axis: _span_axis) holds
+    the whole number of the inventory's main spans that fits over its water (its item 48 is the longest span), centred
+    on it; the stations past them are approaches (no truss). The Smithfield Street Bridge's 305 m of river holds 2 of
+    its 110 m spans (in life, 2 lenses and approach spans): BeamMaps' hand-made one had 3, a fixed 78 m span."""
+    o, ax, lo, hi = axis
+    c = np.array([(L + R) / 2 for L, R, *_ in run])
+    a = (c - o) @ ax - lo
+    length = hi - lo
+    span = max(float(span), 1.0)
+    # (the run reaches SHAPED_ARM of a span past the water each side: the spans that fit over the water itself)
+    n = max(1, int(math.floor(max(length - 2 * SHAPED_ARM * span, 0.0) / span + 0.05)))
+    sl = min(span, length / n)
+    x0 = (length - n * sl) / 2
+    u = (a - x0) / sl
+    keep = (u >= -0.02) & (u <= n + 0.02)
+    u = np.clip(u, 0.0, n)
+    k = np.minimum(np.floor(u), n - 1)
+    return k.astype(int), u - k, keep
+
+
+def _shaped(run, span, shape, pony, axis):
+    """A through truss's stations [(L, R, bot, top, t)] given a curved top chord rising span by span (shape "arched")
+    or a lens (shape "lens": the lower chord also curved, falling from the portals to LENS_BELLY_M over the road, the
+    road hung from it), plus the extra members (the lens's hangers and its portal posts). Pure."""
+    from roadmesh import DECK_DEPTH
+    k, t, keep = _spans_of(run, span, axis)
+    run = [r for r, m in zip(run, keep) if m]
+    k, t = k[keep], t[keep]
+    bump = 4.0 * t * (1.0 - t)
+    out, extra = [], []
+    rise = (LENS_RISE if shape == "lens" else ARCHED_RISE) * span
+    for a, (L, R, bot, top, tt) in enumerate(run):
+        road = bot + DECK_DEPTH                     # the road's height at this station (the lowest deck)
+        end = road + (2.5 if pony else PORTAL_M)
+        top2 = end + rise * bump[a]
+        if shape == "lens":
+            low = end - (end - road - LENS_BELLY_M) * bump[a]
+            out.append((L, R, low, top2, tt))
+            for e in (L, R):                        # the road hung from the lens
+                if low - road > 0.8:
+                    extra.append((np.r_[e, road - 0.3], np.r_[e, low], 0.25, 0.25))
+            if bump[a] < 0.05:                      # a portal post from the deck through the chords' meeting point
+                for e in (L, R):
+                    extra.append((np.r_[e, bot], np.r_[e, end + 2.5], 0.9, 0.9))
+        else:
+            out.append((L, R, bot, max(top2, road + 5.0), tt))
+    return out, extra
+
+
 def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_lines=()):
     """The truss beams [(p (3,), q (3,), w, h)] of a chain of deck parts [(xy (k, 2), z (k,), width)] whose structure
     (chain_structure) is a truss. ground_fn(xy) -> heights, wet_fn(xy) -> bool. Stations every PANEL_M along each
@@ -521,6 +728,10 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
     if info is None or info["type"] not in TRUSS_TYPES:
         return ([], []) if with_piers else []
     span = info["span"] or 100.0
+    shape = info.get("shape")
+    # a lens, a curved-chord truss or a movable bridge's trusses stand over the river spans only (BeamMaps' river
+    # bridges: the truss from bank to bank, two stations past the water); a big cantilever's reach its anchor arms
+    arm = SHAPED_ARM if (shape or info.get("movable")) else ANCHOR_ARM
     small = span < LOW_SPAN_M
     high_m = HIGH_LOW_M if small else HIGH_M
     deck = info["type"] == NBI_DECK_TRUSS
@@ -537,6 +748,13 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
     order = sorted(range(len(P)), key=lambda k: -arcs[k][-1])
     ins_all = _inside(P, info)
     wets = [np.asarray(wet_fn(xy), bool) if wet_fn is not None else np.zeros(len(xy), bool) for xy, _, _ in P]
+    if shape or info.get("movable"):
+        # the river: the sea's depth where it has one, and the low ground under the bridge (a river the sea does not
+        # reach, Pittsburgh's, ~218 m; the Willamette under the Hawthorne Bridge, which the sea's mask held only by its
+        # east bank: one tower and a 40 m truss, 2026-10-27)
+        low = low_water(P, ground_fn, ins_all)
+        if low is not None:
+            wets = [w | np.asarray(low(xy), bool) for w, (xy, _, _) in zip(wets, P)]
     any_wet = any(w.any() for w in wets)
     longest = max(a[-1] for a in arcs)
     placed = []                                 # (centre (2,), unit along (2,), half width)
@@ -552,7 +770,7 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
         if not small:
             if any_wet:
                 ws = s[wets[k]]
-                near = (np.min(np.abs(s[:, None] - ws[None, :]), 1) <= ANCHOR_ARM * span if len(ws)
+                near = (np.min(np.abs(s[:, None] - ws[None, :]), 1) <= arm * span if len(ws)
                         else np.zeros(len(s), bool))
                 mask &= near
             elif s[-1] < 0.5 * longest:
@@ -599,9 +817,15 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
             if run:
                 groups.append(run)
     beams = []
-    for run in groups:
+    axis = _span_axis([r for r in groups if len(r) >= 2]) if shape and not deck and any(len(r) >= 2 for r in groups)         else None
+    for gi, run in enumerate(groups):
         if len(run) < 2:
             continue
+        if axis is not None:
+            run, extra = _shaped(run, span, shape, pony, axis)
+            if len(run) < 2:
+                continue
+            beams += extra
         if not small:                           # a solid pier under each end (the anchor piers)
             for (L, R, bot, top, t), inward in ((run[0], 1.0), (run[-1], -1.0)):
                 wd = float(np.hypot(*(L - R)))
@@ -679,13 +903,21 @@ def _station(P, tans, k, sc, arcs):
     for k2, (xy2, z2, w2) in enumerate(P):
         if k2 == k:
             continue
-        d = np.hypot(*(xy2 - p).T)
+        # the nearest point on its segments, not its nearest node: a suspension span's way can run a kilometre
+        # between nodes, and its twin carriageway was missed there, a tower leg standing in its lanes (25 de Abril,
+        # the Bay Bridge, 2026-10-28)
+        a, b = xy2[:-1], xy2[1:]
+        ab = b - a
+        f = np.clip(((p - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+        q = a + f[:, None] * ab
+        d = np.hypot(*(q - p).T)
         m = int(np.argmin(d))
-        if d[m] > SIDE_REACH_M or abs(tans[k2][m] @ t) < PARALLEL_COS or abs(float((xy2[m] - p) @ t)) > PANEL_M:
+        if d[m] > SIDE_REACH_M or abs(tans[k2][m] @ t) < PARALLEL_COS or abs(float((q[m] - p) @ t)) > PANEL_M:
             continue
-        off = float((xy2[m] - p) @ nrm)
+        off = float((q[m] - p) @ nrm)
+        zq = float(z2[m] + f[m] * (z2[m + 1] - z2[m]))
         lo, hi = min(lo, off - w2 / 2), max(hi, off + w2 / 2)
-        zlo, zhi = min(zlo, float(z2[m])), max(zhi, float(z2[m]))
+        zlo, zhi = min(zlo, zq), max(zhi, zq)
     g = PARAPET_W + SIDE_GAP_M
     return p, t, nrm, lo - g, hi + g, zlo, zhi
 
@@ -887,9 +1119,10 @@ def suspension_members(P, arcs, tans, ms, info, ground_fn, stayed=False):
 
 
 def structure_members(parts, info, ground_fn, wet_fn=None, road_lines=()):
-    """(beams, piers) of a chain's structure (chain_structure): a truss (truss_members), an arch, a suspension or a
-    cable-stayed span (one main span: main_span); ([], []) for a plain deck or a movable span. Each beam carries its
-    paint (p, q, w, h, paint)."""
+    """(beams, piers) of a chain's structure (chain_structure): a truss (truss_members, a lens or a curved top chord
+    where info["shape"] says), an arch, a suspension or a cable-stayed span (one main span: main_span, centred on the
+    river: _river), a movable span (movable_members); ([], []) for a plain deck. Each beam carries its paint (p, q, w,
+    h, paint)."""
     if info is None:
         return [], []
     beams, piers = _structure_members(parts, info, ground_fn, wet_fn, road_lines)
@@ -900,16 +1133,119 @@ def structure_members(parts, info, ground_fn, wet_fn=None, road_lines=()):
 def _structure_members(parts, info, ground_fn, wet_fn, road_lines):
     if info["type"] in TRUSS_TYPES:
         return truss_members(parts, info, ground_fn, wet_fn, with_piers=True, road_lines=road_lines)
+    if info["type"] in MOVABLE_TYPES:
+        return movable_members(parts, info, ground_fn, wet_fn, road_lines)
     if info["type"] not in ARCH_TYPES + (NBI_SUSPENSION, NBI_STAYED):
         return [], []
     P, arcs, tans = _prep(parts)
-    ms = main_span(P, arcs, info, ground_fn, wet_fn)
+    ms = main_span(P, arcs, info, ground_fn, _river(P, info, ground_fn, wet_fn))
     if ms is None:
         return [], []
     if info["type"] in ARCH_TYPES:
         return _clear_of_decks(arch_members(P, arcs, tans, ms, info, ground_fn), P), []
     return _clear_of_decks(suspension_members(P, arcs, tans, ms, info, ground_fn, stayed=info["type"] == NBI_STAYED),
                            P), []
+
+
+LIFT_TOWER = 0.42       # a lift span's towers: their tops over the deck, a share of the span (the Hawthorne Bridge:
+                        # 74 m span, towers 32 m over its deck)
+LIFT_TOWER_MIN, LIFT_TOWER_MAX = 18.0, 70.0
+TOWER_LEG = (1.4, 1.4)  # m, a lift tower's legs
+HOUSE = (5.0, 5.0)      # m, a bascule's control house (plan)
+HOUSE_UP_M = 7.0        # ... its roof over the deck
+LEAF_GIRDER = (0.8, 2.6)    # m, the steel girders along a bascule's leaves under the deck's edges
+BASCULE_PIER_T = 12.0   # m along the bridge: a bascule pier (it holds the leaves' counterweights)
+
+
+def _river(P, info, ground_fn, wet_fn):
+    """wet(xy) -> bool: the sea's depth (wet_fn) or the low ground under the structure (low_water), either; None
+    without both. Where the sea knows no river (Pittsburgh's, Portland's Willamette) main_span centred an arch or a
+    tower pair on the bridge's highest point or its outline instead of the water (the Fort Pitt Bridge's arch on its
+    approach, 2026-10-27)."""
+    low = low_water(P, ground_fn, _inside(P, info))
+    if low is None:
+        return wet_fn
+    if wet_fn is None:
+        return low
+    return lambda xy: np.asarray(wet_fn(xy), bool) | np.asarray(low(xy), bool)
+
+
+def _river_span(P, arcs, info, river):
+    """(part, centre arc, span) of a movable bridge's opening: the inventory's span (else SPAN_SHARE of the water)
+    centred on the longest run over the river (river(xy) -> bool) of any part inside the bridge's outline; None
+    without one (the opening was put on an interchange ramp by main_span's longest-inside part, the Morrison
+    Bridge's, and over no water on an approach chain, the Burnside's, 2026-10-27)."""
+    if river is None:
+        return None
+    ins = _inside(P, info)
+    best = None
+    for k, (xy, _, _) in enumerate(P):
+        s = arcs[k]
+        m = np.asarray(river(xy), bool) & (ins[k] if ins is not None else True)
+        for i, j in _runs(m, s, 1.0):
+            if best is None or s[j] - s[i] > best[0]:
+                best = (s[j] - s[i], k, (s[i] + s[j]) / 2)
+    if best is None or best[0] < SPAN_MIN:
+        return None
+    run, k, c = best
+    L = float(info.get("span") or SPAN_SHARE * run)
+    L = min(L, run, arcs[k][-1] * 0.9)
+    c = float(np.clip(c, L / 2, arcs[k][-1] - L / 2))
+    return k, c, L
+
+
+def movable_members(parts, info, ground_fn, wet_fn=None, road_lines=()):
+    """(beams, piers) of a movable bridge's main span (NBI 15-17; its span from the inventory, centred on the water by
+    main_span). A lift or swing span, or a bascule the map or Wikidata calls a truss (info["truss"]), is a through truss
+    over the river spans (its top chord curved where the map says arch: info["shape"]); a lift span gets its two
+    towers, LIFT_TOWER of its span over the deck. A bascule without one is a deck girder: its leaves' steel girders
+    under the deck's edges, a control house beside the road at each end of the opening and the solid bascule piers
+    under them (the Burnside and Morrison bridges were plain flat decks, the user's screenshots 2026-10-26)."""
+    from roadmesh import DECK_DEPTH, GIRDER_D
+    beams, piers = [], []
+    kind = info["type"]
+    if kind in (NBI_LIFT, NBI_SWING) or info.get("truss"):
+        beams, piers = truss_members(parts, {**info, "type": NBI_THROUGH_TRUSS, "movable": True}, ground_fn, wet_fn,
+                                     with_piers=True, road_lines=road_lines)
+    P, arcs, tans = _prep(parts)
+    ms = _river_span(P, arcs, info, _river(P, info, ground_fn, wet_fn))
+    if ms is None:
+        return beams, piers                     # an opening over no water: another chain's (the approach ramps')
+    k, c, L = ms
+    ends = [_station(P, tans, k, float(sc), arcs) for sc in (c - L / 2, c + L / 2)]
+    if kind == NBI_LIFT:
+        top = float(np.clip(LIFT_TOWER * L, LIFT_TOWER_MIN, LIFT_TOWER_MAX))
+        for p, t, nrm, lo, hi, zlo, zhi in ends:
+            z0, z1 = zlo - DECK_DEPTH, zhi + top
+            legs = [p + nrm * off + t * a for off in (lo - 0.8, hi + 0.8) for a in (-2.0, 2.0)]
+            for e in legs:
+                beams.append((np.r_[e, z0], np.r_[e, z1], *TOWER_LEG))
+            for zz in np.arange(zhi + 8.0, z1 + 1e-6, max(6.0, (z1 - zhi - 8.0) / 4.0)):
+                for a, b in ((0, 2), (1, 3), (0, 1), (2, 3)):
+                    beams.append((np.r_[legs[a], zz], np.r_[legs[b], zz], 0.5, 0.6))
+            mid = p + nrm * (lo + hi) / 2
+            beams.append((np.r_[mid - nrm * (hi - lo) / 2, z1 + 1.5], np.r_[mid + nrm * (hi - lo) / 2, z1 + 1.5],
+                          4.5, 3.0))                # the machinery house on top
+    elif kind == NBI_BASCULE and not info.get("truss"):
+        sc0, sc1 = c - L / 2, c + L / 2
+        n = max(int(round(L / PANEL_M)), 2)
+        st = _ribs(P, tans, arcs, k, sc0, sc1, n)
+        for which in (4, 5):                        # the leaves' girders under each edge
+            for a in range(n):
+                e0 = st[a][1] + st[a][3] * (st[a][which] + (1.0 if which == 4 else -1.0))
+                e1 = st[a + 1][1] + st[a + 1][3] * (st[a + 1][which] + (1.0 if which == 4 else -1.0))
+                beams.append((np.r_[e0, st[a][6] - DECK_DEPTH - LEAF_GIRDER[1] / 2],
+                              np.r_[e1, st[a + 1][6] - DECK_DEPTH - LEAF_GIRDER[1] / 2], *LEAF_GIRDER))
+        for p, t, nrm, lo, hi, zlo, zhi in ends:
+            for off in (lo - HOUSE[0] / 2, hi + HOUSE[0] / 2):
+                e = p + nrm * off
+                beams.append((np.r_[e, zlo - DECK_DEPTH - GIRDER_D], np.r_[e, zhi + HOUSE_UP_M], *HOUSE))
+            gz = float(np.asarray(ground_fn(p[None]), np.float64)[0])
+            z_top = zlo - DECK_DEPTH - GIRDER_D
+            if z_top - gz > 2.0:
+                piers.append((float(p[0]), float(p[1]), float(t[0]), float(t[1]), float(z_top), gz - 2.0,
+                              float(hi - lo + HOUSE[0] * 2), BASCULE_PIER_T))
+    return beams, piers
 
 
 HEADROOM_M = 5.0        # _clear_of_decks: a member this little over a carriageway is in the traffic's way

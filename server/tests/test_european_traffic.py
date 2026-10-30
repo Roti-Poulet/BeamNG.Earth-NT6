@@ -120,6 +120,15 @@ class NarrowAndCurvedStreets(unittest.TestCase):
         self.assertTrue(g["edges"])
         self.assertTrue(all(e[7] == 1.5 and e[5] <= navgraph.NARROW_MS + 0.01 for e in g["edges"]))
 
+    def test_a_narrow_rural_road_keeps_its_limit(self):
+        # GitHub #451: the Netherlands' 60 km/h country roads (~5 m wide) were all held to 30 km/h
+        f = features([[(0, 0), (200, 0)]], ["unclassified"])
+        f.attrs["osm_maxspeed"] = np.array([60.0])
+        rural = lambda la, lo: np.zeros(np.shape(la), bool)
+        g = navgraph.build(FRAME, [f], flat, (0, 0), urban_fn=rural)
+        self.assertTrue(g["edges"])
+        self.assertTrue(all(e[5] > navgraph.NARROW_MS + 1.0 for e in g["edges"]))
+
     def test_shallow_s_bends_in_a_three_metre_street_are_not_straightened(self):
         f = features([[(0, 0), (20, 0.4), (40, -0.4), (60, 0)]], ["residential"], widths=[(0, 3.0)])
         g = navgraph.build(FRAME, [f], flat, (0, 0))

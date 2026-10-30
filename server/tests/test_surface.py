@@ -406,6 +406,50 @@ class LotTest(unittest.TestCase):
         self.assertEqual(out[40, 40], sf.GRASS)
         self.assertEqual(int((out == sf.ASPHALT).sum()), int((sf.paint_lots(idx, lat, lon, [Lots()]) == sf.ASPHALT).sum()))
 
+    def test_grass_lot_stays_grass(self):
+        lat0, lon0 = 40.0, -76.0
+        lat = lat0 + np.arange(50)[:, None] * 2e-5 + np.zeros((1, 50))
+        lon = lon0 + np.arange(50)[None, :] * 2.6e-5 + np.zeros((50, 1))
+
+        class Lots:
+            kind = np.array([3], np.uint8)
+            attrs = {"class": np.array(["parking"], object), "surface": np.array(["grass"], object)}
+
+            def __len__(self):
+                return 1
+
+            def parts(self, i):
+                a, b = lon0 + 10 * 2.6e-5, lon0 + 20 * 2.6e-5
+                c, d = lat0 + 10 * 2e-5, lat0 + 20 * 2e-5
+                return [[np.array([(a, c), (b, c), (b, d), (a, d), (a, c)])]]
+        idx = np.full((50, 50), sf.GRASS, np.uint8)
+        self.assertTrue(np.array_equal(sf.paint_lots(idx, lat, lon, [Lots()]), idx))
+
+    def test_photo_lots_asphalt(self):
+        import geodesy
+        frame = geodesy.EnuFrame(40.0, -76.0)
+        e = np.array([-20.0, 20.0, 20.0, -20.0, -20.0])
+        n = np.array([-15.0, -15.0, 15.0, 15.0, -15.0])
+        la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(5))
+
+        class Lots:
+            kind = np.array([3], np.uint8)
+            attrs = {"class": np.array(["parking"], object)}
+
+            def __len__(self):
+                return 1
+
+            def parts(self, i):
+                return [[np.stack([lo, la], 1)]]
+        rgb = np.full((64, 64, 3), 30, np.uint8)
+        out = sf.photo_lots(rgb, frame, -32.0, -32.0, 64.0, [Lots()])
+        self.assertGreater(int(out[32, 32, 0]), 60, "the lot painted")
+        self.assertEqual(int(out[2, 2, 0]), 30, "the photo kept off it")
+        self.assertTrue(np.array_equal(rgb[32, 32], [30, 30, 30]), "the input untouched")
+        m = sf.lots_mask(frame, -32.0, -32.0, 64.0, 64, [Lots()])
+        self.assertEqual(int(m[32, 32]), 255)
+        self.assertEqual(int(m[2, 2]), 0)
+
 
     def test_square_painted_paving(self):
         """A land-use square (subtype pedestrian) is paving (the Zocalo read as dirt); a park is not."""

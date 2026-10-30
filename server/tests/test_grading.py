@@ -79,6 +79,24 @@ class BankTest(unittest.TestCase):
         z = grading.grade_points(pts[:, 0], pts[:, 1], np.full(2, 50.0), [plan])
         self.assertAlmostEqual(float(z[1] - z[0]), -mid * 8.0, places=1)
 
+    def test_a_curve_of_long_chords_is_banked_evenly(self):
+        # a map line draws a curve as straight pieces turning at vertices ~100 m apart (I-80 in Wyoming, Discord
+        # 2026-10-28: "a series of bumps where the bank would be"): the bank holds through the curve, not one per vertex
+        r = 600.0
+        th = np.arange(0.0, 1.2, 100.0 / r)
+        verts = np.stack([r * np.sin(th), r - r * np.cos(th)], axis=1)
+        xy = [verts[0]]
+        for a, b in zip(verts[:-1], verts[1:]):        # (resampled every 2 m, as the plans are)
+            k = max(1, int(np.hypot(*(b - a)) // 2.0))
+            xy.extend(a + (b - a) * (t / k) for t in range(1, k + 1))
+        xy = np.asarray(xy)
+        b = grading.bank(xy, roads.Spec(11.0, "paved", False, "motorway"), ext=(1, 1))
+        arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        body = b[(arc > 150.0) & (arc < arc[-1] - 150.0)]
+        self.assertGreater(len(body), 50)
+        self.assertLess(float(body.max() - body.min()), 0.012)       # (it was 0 % between vertices, 8 % at them)
+        self.assertLess(float(body.max()), -0.05)
+
     def test_straight_and_city_streets_level(self):
         xy = np.stack([np.arange(0, 300, 2.0), np.zeros(150)], axis=1)
         self.assertIsNone(grading.bank(xy, roads.Spec(11.0, "paved", False, "motorway"), ext=(1, 1)))
@@ -241,16 +259,35 @@ class SharpCutTest(unittest.TestCase):
 
         def elev(la, lo):
             _e, n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), np.zeros(np.shape(la)))
-            return 10.0 + 4.0 / (1.0 + np.exp(-(n - 8.0) / 0.8))
+            return 10.0 + 5.0 / (1.0 + np.exp(-(n - 8.0) / 0.8))
         grading._add_cuts(FRAME, [p], elev)
         self.assertIsNotNone(p.cut)
         self.assertEqual(p.cut.shape, (10, 6))
         wall, top, reach = p.cut[:, 0], p.cut[:, 1], p.cut[:, 2]
         self.assertTrue(np.isfinite(wall).all() and np.isfinite(top).all())
         np.testing.assert_allclose(wall, 8.0, atol=1.01)                # the half-way point of the climb
-        np.testing.assert_allclose(top, 10.0 + 3.6, atol=0.4)          # 90 % of it
+        np.testing.assert_allclose(top, 10.0 + 4.5, atol=0.5)          # 90 % of it
         self.assertTrue((reach > wall).all())
         self.assertTrue(np.isnan(p.cut[:, 3:]).all(), "the open side: no cutting")
+
+    def test_a_low_bank_on_one_side_is_no_wall_but_a_trench_is(self):
+        """A 2.5 m bank beside a road: a graded slope (US-163, Utah: a low rock bank was a concrete wall); the same depth
+        on both sides (a trench, as Munich's McGraw-Graben): its walls."""
+        import types
+        xy = np.c_[np.arange(0.0, 81.0, 8.0), np.zeros(11)]
+        for both in (False, True):
+            p = types.SimpleNamespace(xy=xy, z=np.full(11, 10.0), half=5.0, road_half=4.0, cut=None)
+
+            def elev(la, lo, both=both):
+                _e, n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), np.zeros(np.shape(la)))
+                up = 2.5 / (1.0 + np.exp(-(n - 8.0) / 0.8))
+                return 10.0 + up + (2.5 / (1.0 + np.exp((n + 8.0) / 0.8)) if both else 0.0)
+            grading._add_cuts(FRAME, [p], elev)
+            if not both:
+                self.assertTrue(p.cut is None or np.isnan(p.cut[:, [1, 4]]).all(), "a lone low bank: no cutting")
+            else:
+                self.assertIsNotNone(p.cut)
+                self.assertTrue(np.isfinite(p.cut[:, 1]).all() and np.isfinite(p.cut[:, 4]).all(), "a trench: both walls")
 
     def test_gentle_slope_is_no_wall(self):
         import types
@@ -604,5 +641,100 @@ class NeverRaisedTest(unittest.TestCase):
         self.assertFalse(grading._never_raised(S(8.0, "paved", False, "secondary", False)))
 
 
+class JunctionTest(unittest.TestCase):
+    def test_side_road_meets_the_road_it_joins(self):
+        import roads
+        x = np.arange(-200, 201, 4.0)
+        main = grading.Plan(np.stack([x, 0 * x], 1), 10 + 0.02 * x, 5, road_half=4)
+        y = np.arange(0, 201, 4.0)
+        side = grading.Plan(np.stack([0 * y + 50, y], 1), 11.8 + 0 * y, 3, road_half=3)   # 0.8 m over the main road
+        grading.snap_junctions([main, side], [roads.Spec(8.0, "paved", False, "primary", False),
+                                              roads.Spec(6.0, "paved", False, "residential", False)])
+        self.assertAlmostEqual(side.z[0], 11.0, places=6)                  # at the main road's height where it joins
+        self.assertAlmostEqual(side.z[-1], 11.8, places=6)                 # its own height past the taper
+        self.assertTrue(np.all(np.diff(side.z[:12]) >= -1e-9))             # eased in, no bump
+        np.testing.assert_allclose(main.z, 10 + 0.02 * x)                  # the main road keeps its profile
+
+    def test_a_side_road_follows_its_road_down_into_a_dip(self):
+        """Baltimore's Haven Street (2026-10-28): the alleys were snapped to the street before the underpass dip lowered
+        it 3.5 m, each a hump; snapped again after the dips, they meet it at its new height (a second snap is what
+        Grader._make_cell runs after _lower_underpasses)."""
+        import roads
+        x = np.arange(-200, 201, 4.0)
+        main = grading.Plan(np.stack([x, 0 * x], 1), 10.0 + 0 * x, 5, road_half=4)
+        y = np.arange(0, 101, 4.0)
+        side = grading.Plan(np.stack([0 * y + 50, y], 1), 10.0 + 0 * y, 2, road_half=2)
+        specs = [roads.Spec(8.0, "paved", False, "primary", False), roads.Spec(4.0, "paved", False, "service", False)]
+        grading.snap_junctions([main, side], specs)
+        main.z = main.z - 3.0 * np.exp(-((x - 60.0) / 40.0) ** 2)     # the dip, after the first snap
+        grading.snap_junctions([main, side], specs)
+        _d, zq, _e = grading._nearest_on(main, 50.0, 0.0)
+        self.assertAlmostEqual(side.z[0], zq, places=6)
+        self.assertAlmostEqual(side.z[-1], 10.0, places=6)
+
+    def test_a_road_crossing_a_bigger_one_meets_it_there(self):
+        """GitHub #414 (Perm): a service road crossing a primary at a shared node, 4 m higher, stood as a wall across
+        it; it takes the primary's height at the crossing, eased in either side; the primary keeps its own. (Opt-in with
+        the coarse easing: BNE_COARSE_EASE=1.)"""
+        import roads
+        from unittest import mock
+        patcher = mock.patch.object(grading, "COARSE_EASE_ON", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        x = np.arange(-200, 201, 4.0)
+        main = grading.Plan(np.stack([x, 0 * x], 1), 10.0 + 0 * x, 5, road_half=5)
+        y = np.arange(-200, 201, 4.0)
+        cross = grading.Plan(np.stack([0 * y + 20, y], 1), 14.0 + 0 * y, 3, road_half=2)
+        grading.snap_junctions([main, cross], [roads.Spec(10.0, "paved", False, "primary", False),
+                                               roads.Spec(4.0, "paved", False, "service", False)])
+        mid = int(np.argmin(np.abs(y)))
+        self.assertAlmostEqual(cross.z[mid], 10.0, places=6)
+        self.assertAlmostEqual(cross.z[0], 14.0, places=6)
+        np.testing.assert_allclose(main.z, 10.0)
+
+    def test_a_continuation_is_not_a_junction(self):
+        import roads
+        x = np.arange(0, 201, 4.0)
+        a = grading.Plan(np.stack([x, 0 * x], 1), 10 + 0 * x, 4, road_half=3)
+        b = grading.Plan(np.stack([x + 200, 0 * x], 1), 11 + 0 * x, 4, road_half=3)
+        res = roads.Spec(6.0, "paved", False, "residential", False)
+        grading.snap_junctions([a, b], [res, res])
+        self.assertEqual((a.z[-1], b.z[0]), (10.0, 11.0))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoarseEaseTest(unittest.TestCase):
+    """earthfast.ease_coarse (GitHub #414): roads side by side on a coarse DEM brought together."""
+
+    def run_ease(self, z_main, z_side, gap_y, rank_side=1, take=(1, 1)):
+        import fast
+        fast.require(94, "ease_coarse")
+        x = np.linspace(0.0, 200.0, 41)
+        xy = np.concatenate([np.c_[x, np.zeros_like(x)], np.c_[x, np.full_like(x, gap_y)]])
+        z = np.concatenate([np.full_like(x, z_main), np.full_like(x, z_side)])
+        off = np.array([0, len(x), 2 * len(x)], np.int64)
+        out = fast._ef.ease_coarse(np.ascontiguousarray(xy), z, off, np.array([7, rank_side], np.int64),
+                                   np.array([4.0, 2.0]), np.array(take, np.uint8), grading.COARSE_REACH_M,
+                                   grading.COARSE_MAX_STEP_M, grading.COARSE_MAX_SLOPE, grading.COARSE_SIGMA_M)
+        return out[:len(x)], out[len(x):]
+
+    def test_a_service_road_beside_a_primary_comes_down_to_it(self):
+        main, side = self.run_ease(100.0, 104.5, 7.0)
+        np.testing.assert_allclose(main, 100.0)                     # the higher rank stays
+        self.assertLess(float(np.median(side)), 101.0)               # the 4.5 m wall mostly gone
+        self.assertGreater(float(np.median(side)), 100.0)            # (a little cross slope kept)
+
+    def test_far_roads_and_real_separations_stay(self):
+        _m, far = self.run_ease(100.0, 104.5, 60.0)
+        np.testing.assert_allclose(far, 104.5)
+        _m, sep = self.run_ease(100.0, 108.0, 7.0)                   # 8 m: an overpass or a cutting, left alone
+        np.testing.assert_allclose(sep, 108.0)
+        _m, kept = self.run_ease(100.0, 104.5, 7.0, take=(1, 0))      # a bridge approach: as it was
+        np.testing.assert_allclose(kept, 104.5)
+
+    def test_equal_ranks_meet_halfway(self):
+        main, side = self.run_ease(100.0, 104.0, 7.0, rank_side=7)
+        self.assertLess(float(np.median(side) - np.median(main)), 2.5)

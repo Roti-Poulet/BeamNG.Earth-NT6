@@ -197,6 +197,22 @@ class TrimOverlapsTest(unittest.TestCase):
             np.testing.assert_allclose(r[0], ramp[0][0])
 
 
+class BridgeCurbSelectionTest(unittest.TestCase):
+    def test_low_curb_is_limited_to_decks_with_mapped_support(self):
+        chunks = [
+            {"m": "road_asphalt_2lane", "w": 8.0, "tl": 11.0, "p": 20,
+             "deck": True, "fixed": True, "fid": "supported",
+             "n": [[0.0, 0.0, 20.0], [50.0, 0.0, 20.0]]},
+            {"m": "road_asphalt_2lane", "w": 8.0, "tl": 11.0, "p": 30,
+             "deck": True, "fixed": True, "fid": "unsupported",
+             "n": [[100.0, 0.0, 30.0], [150.0, 0.0, 30.0]]},
+        ]
+        P, T, UV, mats, M = roadmesh.deck(chunks, (0.0, 0.0, 0.0), low_parapet_decks={0})
+        low = P[(P[:, 0] >= 0.0) & (P[:, 0] <= 50.0)]
+        high = P[(P[:, 0] >= 100.0) & (P[:, 0] <= 150.0)]
+        self.assertAlmostEqual(float(low[:, 2].max() - 20.0), roadmesh.BRIDGE_CURB_H, places=6)
+        self.assertAlmostEqual(float(high[:, 2].max() - 30.0), roadmesh.PARAPET_H, places=6)
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -221,7 +237,9 @@ class BridgeTest(unittest.TestCase):
         flat = np.abs(n[:, 2]) > 0.5
         c = P[T].mean(1)
         high = c[:, 2] > 20.0 + 0.04 * c[:, 0] - roadmesh.DECK_DEPTH / 2   # the top rises 20 -> 22 m
-        self.assertTrue((n[flat & high, 2] > 0).all() and (flat & high).any(), "the top faces up")
+        # (the parapets are closed solids since 2026-10-27: their undersides, on the slab's edge, face down)
+        road = np.abs(c[:, 1]) < 4.0
+        self.assertTrue((n[flat & high & road, 2] > 0).all() and (flat & high & road).any(), "the top faces up")
         self.assertTrue((n[flat & ~high, 2] < 0).all() and (flat & ~high).any(), "the underside faces down")
         self.assertAlmostEqual(P[:, 2].max(), 22.0 + roadmesh.PARAPET_H, msg="a parapet on each edge")
         self.assertAlmostEqual(P[:, 2].min(), 20.0 - roadmesh.DECK_DEPTH - roadmesh.GIRDER_D, msg="girders under it")
@@ -239,6 +257,29 @@ class BridgeLookTest(unittest.TestCase):
 
     def parapet_tops(self, P):
         return P[np.abs(P[:, 2] - (20.0 + roadmesh.PARAPET_H)) < 1e-6]
+
+    def test_parapet_runs_are_the_drawn_concrete_wall_lines(self):
+        runs = roadmesh.parapet_runs([self.deck(0.0, "a")])
+        self.assertEqual(len(runs), 2)
+        ys = sorted(float(np.mean(run["line"][:, 1])) for run in runs)
+        offset = 4.0 + roadmesh.PARAPET_W / 2
+        np.testing.assert_allclose(ys, [-offset, offset], atol=0.02)
+
+    def test_deck_accepts_xy_outward_normals_for_generated_parapets(self):
+        deck = self.deck(0.0, "a")
+        runs = roadmesh.parapet_runs([deck])
+        self.assertTrue(runs)
+        self.assertEqual(runs[0]["out"].shape[1], 2, "parapet runs store horizontal normals")
+        P, T, UV, mats, M = roadmesh.deck([deck], (0.0, 0.0, 0.0), parapets=runs)
+        self.assertEqual(P.shape[1], 3)
+        self.assertGreater(len(T), 0)
+
+    def test_parapet_runs_exclude_the_centre_between_adjacent_decks(self):
+        runs = roadmesh.parapet_runs([self.deck(0.0, "a"), self.deck(8.0, "b")])
+        self.assertEqual(len(runs), 2)
+        ys = sorted(float(np.mean(run["line"][:, 1])) for run in runs)
+        self.assertLess(ys[0], -4.0)
+        self.assertGreater(ys[1], 12.0)
 
     def test_no_parapet_between_decks_side_by_side(self):
         P = roadmesh.deck([self.deck(0.0, "a"), self.deck(8.0, "b")], (0.0, 0.0, 0.0))[0]
@@ -412,7 +453,8 @@ class BridgeProfilesTest(unittest.TestCase):
         hi_xy, hi_z = got["high"]
         zl = lo_z[int(np.argmin(np.abs(lo_xy[:, 0])))]
         zh = hi_z[int(np.argmin(np.abs(hi_xy[:, 1])))]
-        self.assertGreaterEqual(zh - zl, roads.DECK_ROAD_CLEAR - 0.6, (zl, zh))
+        # (the upper deck's own depth: roads.deck_depth of its span)
+        self.assertGreaterEqual(zh - zl, roads.deck_road_clear(bp.depth_of("high")) - 0.6, (zl, zh))
 
     def test_short_bridge_no_wall_and_splits_merge(self):
         import roads

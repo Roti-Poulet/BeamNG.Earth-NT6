@@ -764,9 +764,15 @@ over to AWS, a 400 wrote a permanent `.404` marker, and the User-Agent lived in 
   (`kind = 'start'`, from `onLevelStart` or the first hello); newest first, an older one within 200 m
   goes (its name stays when the new one has none), at most 10. A refused teleport (no server,
   invalid lat/lon) is not recorded. The recording is a pcall: a file problem never stops a teleport.
-- Go (`places.goTo`): only with `beamngEarth_core` loaded, the server connected and a player vehicle
-  (`getPlayerVehicle(0)`), else the reason (the page shows it and disables Go); then
-  `beamngEarth_core.teleport(lat, lon, name)`.
+- Go (`places.goTo`): only with `beamngEarth_core` loaded, the server connected and the BeamNG.Earth level
+  loaded (`_state().inOurLevel`) and the ground where the player is in (`groundReady`: no teleport under way, set
+  down, no drop hold; never for good: a failed teleport waiting to be asked again, or one unanswered for
+  `GO_WAIT_MAX_S`, lets another place be asked), else the reason (the page shows it and disables Go); then
+  `beamngEarth_core.teleport(lat, lon, name)`. No car is needed: with none the free camera goes to the target
+  (core `moveCamera` in the commit frame, then over the ground there in `placePlayer`, held as the player until it
+  reads back there; a later move down onto a tunnel's floor leaves a camera flown away alone); with a car and the free
+  camera on, the camera goes along behind the car, over the ground there. luajit `test_teleport_nocar.lua`. Still to
+  check in-game: that `core_camera.setPosRot` moves the free camera in single player as it does in BeamMP.
 - `places.parseLatLon(text)`: "36.5785, -118.2923" (Google Maps' copy), space-separated, N/S/E/W as
   prefix or suffix (either order: a N/S coordinate is the latitude), degrees-minutes(-seconds) with
   or without °'" (and ′″, no-break spaces); refuses one number, three coordinates, two latitudes,
@@ -972,6 +978,35 @@ three days of testing: dem 741 MB / 7.5k files, imagery 1.4 GB / 35k, deshadow 7
   re-sends everything. The tile is written as `roads_<a>_<tx>_<ty>.json` in the session folder and
   announced as `roads_tile` {anchorId, key, path, n}, then `roads_drop` {anchorId, key}. The mod
   sends `roads_reset` after the Roads setting is switched back on.
+- Highway signs (`server/signstream.py`, from cody196's PR #363): for each road tile the mod has, the same road
+  processes build a sign tile (exit and overhead panels, merge warnings, Interstate mile markers; render-only
+  shapes `exits` / `mileposts` / `merges`), announced as `roads_tile` with key `s<tx>_<ty>` (one in flight a
+  connection; an empty one is not sent unless it replaces signs). The sources come from the weekly sign shards
+  (`tools/build_sign_tags.py` -> BeamNG.Earth-data Pages `signs/`, read by `railtags.SignTags`; `BNE_SIGNS_DIR`: a
+  local shard folder), placed on the roads' own pavement rows (`signroads.Context`, per map cell); only where a US
+  state is (every face is MUTCD; `BNE_SIGNS_WORLD=1` everywhere). The mod's Highway signs switch sends
+  `highway_signs` {on}: no sign tiles are built while it is off.
+- Graphics settings (2026-10-28; settings.lua PRESETS low / medium / high / ultra / extreme): the mod sends
+  `graphics` {lodScale, treeScale, buildingScale, photoPx} after every hello and on a change (core.sendGraphics):
+  the far field's K times lodScale, the tree tiles' and the far buildings' / skyline's / far bridges' reach times
+  their scales, the block photo's size (terrain.lua points the texture set and every layer's flat base maps at that
+  size before a level's first block). Mod-only knobs: tree density (trees.lua QUALITY_LEVELS), grass distance
+  (groundcover.lua DISTANCE), object detail ($pref::TS::detailAdjust in our level, enginepref.lua).
+- Every reach that decides what is loaded or shown is a disc (2026-10-28): roads.tiles_near / tile_distance and the
+  vegetation trackers' squares (tree tiles, far buildings' groups, skyline squares, far bridges) by the Euclidean
+  distance to the square's nearest point, dropped beyond their drop distance by the same rule (the hysteresis), and
+  the mod's ghost releases after a rebase likewise. Purely internal squares stay: the terrain block and its
+  follow / prefetch rules (Chebyshev from the block centre), the map cells warmed around a place, the AI graph's
+  graded square (blockworker.NAV_GRADED_M), the sea's physics water block, the far field's quadtree (already a disc).
+- Speed-limit signs (`server/speedsigns.py`, kernels `speed_sign_place` / `speed_sign_mesh` in
+  `native/earthfast/src/speedsigns.rs`): in the same sign tiles (shape `speeds`), everywhere. The value is
+  `navgraph.road_mph`'s (the AI's: Overture's / OpenStreetMap's limit, else the class default) in the posted unit.
+  Per direction on the road pieces between junctions (Overture connectors) round the tile (900 m): a sign where the
+  limit changes (at a junction's straight-on continuation or inside a road), past major junctions (a secondary-or-better
+  road meets a tertiary-or-better one), 300 m past motorway entrances, and reminders where a road crosses a fixed
+  lat/lon grid (about 1 mile in town, 2 out of it); thinned per value and direction, placed beside the carriageway
+  clear of every pavement, off bridges and tunnels. Faces: MUTCD R2-1 in the US, Rb-1 in Canada, Vienna C14
+  elsewhere. (They replaced the furniture props of 2026-10-14, 30 m past both ends of every long segment.)
 - Build: class and rules give the width (STYLE, or the width rule) and the surface kind (paved /
   gravel / dirt). Footways, paths and steps are left out, and so are segments flagged as bridge or
   tunnel or off ground level. Each road is clipped to the tile plus 2 m, simplified (RDP 0.25 m),

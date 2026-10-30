@@ -1,0 +1,46 @@
+{
+  "bne_cable_steel": {
+    "name": "bne_cable_steel",
+    "mapTo": "bne_cable_steel",
+    "class": "Material",
+    "version": 1.5,
+    "persistentId": "861f5260-81ea-5231-95e2-0b884f7518b2",
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.58,
+          0.59,
+          0.6,
+          1.0
+        ],
+        "metallicFactor": 0.85,
+        "roughnessFactor": 0.5
+      },
+      {},
+      {},
+      {}
+    ]
+  },
+  "bne_cable_reflector": {
+    "name": "bne_cable_reflector",
+    "mapTo": "bne_cable_reflector",
+    "class": "Material",
+    "version": 1.5,
+    "persistentId": "2187faa0-ea26-56a8-a807-39182a0892cc",
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.92,
+          0.92,
+          0.9,
+          1.0
+        ],
+        "metallicFactor": 0.0,
+        "roughnessFactor": 0.3
+      },
+      {},
+      {},
+      {}
+    ]
+  }
+}

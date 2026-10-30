@@ -153,7 +153,14 @@ def pyinstaller(work, ico, onefile, ver=None, boot=None):
            "--add-data", f"{os.path.join(server, 'oil_wells.npz')}{SEP}.",  # (oilwells.PATH)
            "--add-data", f"{os.path.join(server, 'refineries.npz')}{SEP}.",  # (industry.PATH)
            # (overture.BUNDLED: the pinned release's STAC index, tools/build_stac_index.py)
-           "--add-data", f"{os.path.join(server, 'overture_stac_' + _overture_release() + '.json.gz')}{SEP}."]
+           "--add-data", f"{os.path.join(server, 'overture_stac_' + _overture_release() + '.json.gz')}{SEP}.",
+           "--add-data", f"{os.path.join(server, 'lidarbc_index.json.gz')}{SEP}.",     # (lidarbc.INDEX_PATH)
+           "--add-data", f"{os.path.join(server, 'lidarbc_dsm_index.json.gz')}{SEP}.",     # (lidarbc.DSM_INDEX_PATH)
+           "--add-data", f"{os.path.join(server, 'lidarbc_ortho_index.json.gz')}{SEP}.",     # (bcortho.INDEX_PATH)
+           "--add-data", f"{os.path.join(server, 'usgs3dep_index.json.gz')}{SEP}.",     # (roadz.LIDAR_INDEX_PATH)
+           # the highway signs' lettering metrics and US state outlines (exitsigns.GLYPHS, signstates.DATA)
+           "--add-data", f"{os.path.join(server, 'sign_glyphs.json')}{SEP}.",
+           "--add-data", f"{os.path.join(server, 'sign_states.geojson')}{SEP}."]
     # the sources' fingerprint (peerwork.code_id: compute-sharing helpers build only for the same code)
     sys.path.insert(0, server)
     import peerwork

@@ -25,11 +25,16 @@ import railways
 
 log = logging.getLogger("earthd.gradesep")
 
-# Off by default (2026-10-27 in-game A/B on fresh caches): every cell whose level ranges are asked reads its eight
-# neighbours, and grading asks a ring of cells round a road tile, so a first visit read about twice the roads cells
-# (PC: +7-12 s to the first road tile; Steam Deck, no warm-up threads: first road tile 141 s against 91 s off).
-# BNE_GRADESEP=on turns it on.
-ON = os.environ.get("BNE_GRADESEP", "off") == "on"
+# All of it off by default (2026-10-27 in-game A/B on fresh caches): every cell whose level ranges are asked reads its
+# eight neighbours, and grading asks a ring of cells round a road tile, so a first visit read about twice the roads
+# cells (PC: +7-12 s to the first road tile; Steam Deck, no warm-up threads: first road tile 141 s against 91 s off).
+# BNE_GRADESEP=on turns it on. The default, "tunnels": only a line over another's short tunnel (an underpass OSM maps
+# as the lower road's tunnel, a railway's short "tunnel" under a road bridge: GitHub #450, the A-7 at Malaga on two
+# short decks over an open road, drawn as a tube in an embankment), and a cell's neighbours read only when the cell
+# has such a tunnel itself (few do: no cost elsewhere). off: none.
+MODE = os.environ.get("BNE_GRADESEP", "tunnels")
+ON = MODE == "on"
+TUNNELS = MODE in ("on", "tunnels")
 VERSION = 1             # in MapData.versions(): every cell's ranges (cell_facts) and tiles made again on a change
 DEM_ZOOM = 15
 SEP_M = 4.0             # m the upper line's ground stands above the lower one's (medians of four heights each)
@@ -68,7 +73,7 @@ def hook(md, key):
         with lock:
             got = memo.get("spans")
             if got is None:
-                got = memo["spans"] = _spans(md, key, feats) if ON else {}
+                got = memo["spans"] = _spans(md, key, feats) if TUNNELS else {}
         return got
     return run
 
@@ -143,6 +148,8 @@ def _pieces(feats, i, kind):
 def _spans(md, key, feats):
     if feats is None or not len(feats) or "subtype" not in feats.attrs:
         return {}
+    if not ON and not any(p[0] in (2, 3) for i in range(len(feats)) for p in (_row(feats, i)[2] or ())):
+        return {}                   # (tunnels only, and the cell has none)
     import revisit
     try:
         others = _neighbours(md, key)
@@ -219,6 +226,9 @@ def _spans(md, key, feats):
     cand, smp = fast._ef.gradesep_candidates(pts, starts, kinds, halves, np.asarray(groups, np.int64),
                                              np.ascontiguousarray(de), np.array(
         [END_M, SAMPLE_GAP_M, SAMPLE_STEP_M, MIN_SIN, TOUCH_M, GAP_MAX_M, TURN_COS, GAP_SHARE], np.float64))
+    if not ON and len(cand):        # (tunnels only: the lines over a short tunnel, how 1)
+        one = cand[:, 5] == 1.0
+        cand, smp = cand[one], smp.reshape(-1, 8, 2)[one].reshape(-1, 2)
     out, why = {}, []                   # (why: (row, from, to, how) for probes, feats._gradesep_why)
     for ln, k in enumerate(kinds):      # the underpasses: ground under the road now bridging them
         i, a, b = owner[ln]

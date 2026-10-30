@@ -20,6 +20,9 @@ SAG = 0.03                  # the sag at mid-span per metre of span
 SEG_M = 10.0
 MIN_SPAN_M, MAX_SPAN_M = 15.0, 2000.0
 DEDUPE_M = 6.0
+TOWER_ROAD_CLEAR_M = 6.0    # m off a public road's carriageway edge a tower's centre stands (its base ~10 m square):
+                            # a line's mapped tower node a few metres off put a pylon on a highway's shoulder, in the way
+                            # (TGForever Discord, 2026-10-28)
 WIRE_R = 0.022              # the conductors' half width (West Coast USA's read about twice a street wire's)
 # The yards: West Coast USA's substation yard (-238, 20) as a kit, in its parts' own frame (its forest4 files'
 # rotationMatrix rows are the parts' axes; read across, every part sat turned 90 degrees and the busbars ended in the
@@ -113,6 +116,52 @@ def _near(frame, ring, box):
     return out
 
 
+def _off_roads(frame, md, e, n, ll):
+    """The line vertices (e, n: frame m; ll: their lon/lat) moved off the public roads' carriageways: one closer than
+    half the carriageway + TOWER_ROAD_CLEAR_M to a road's centreline goes straight away from it to that distance (up
+    to three roads in turn). Each vertex reads the roads of its own map cell and the 8 around it, so every road tile
+    (and every process) moves it alike: the same towers and wires on both sides of a tile edge."""
+    import gasstations
+    import mapcells
+    e, n = e.copy(), n.copy()
+    layers = {}
+
+    def roads_of(key):
+        got = layers.get(key)
+        if got is None:
+            got = []
+            for k in [key] + key.neighbours():
+                try:
+                    got.append(md.cell(k, layers=("roads",), kind="demand").layers.get("roads"))
+                except Exception:       # (a cell not at hand: the vertex stays where it is mapped)
+                    got.append(None)
+            layers[key] = got
+        return got
+    for i in range(len(e)):
+        lines = gasstations.drive_lines(frame, roads_of(mapcells.cell_of(float(ll[i, 1]), float(ll[i, 0]))),
+                                        float(e[i]), float(n[i]), 30.0)
+        for _ in range(3):
+            moved = False
+            p = np.array([e[i], n[i]])
+            for line, hw in lines:
+                a, b = line[:-1], line[1:]
+                ab = b - a
+                t = np.clip(((p - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+                foot = a + t[:, None] * ab
+                d = np.hypot(*(p - foot).T)
+                k = int(np.argmin(d))
+                need = hw + TOWER_ROAD_CLEAR_M
+                if d[k] < need:
+                    away = (p - foot[k]) / d[k] if d[k] > 1e-6 else np.array([-ab[k, 1], ab[k, 0]]) / max(
+                        float(np.hypot(*ab[k])), 1e-9)
+                    p = foot[k] + away * need
+                    moved = True
+            e[i], n[i] = p
+            if not moved:
+                break
+    return e, n
+
+
 def tile_lines(frame, tx, ty, md, elev, props, wires):
     """Add road tile (tx, ty)'s towers, gantries, substation yards (props rows, furniture.place's form) and conductors
     (wires polylines) of the power lines near it; elev(lat, lon): the ground."""
@@ -145,8 +194,11 @@ def tile_lines(frame, tx, ty, md, elev, props, wires):
         lines.sort(key=lambda q: q[0])          # (the same order in every tile: shared towers decided alike)
         ll = np.concatenate([r for _, r in lines])
         e, n, _ = frame.geodetic_to_enu(ll[:, 1], ll[:, 0], np.zeros(len(ll)))
-        _, _, z = frame.geodetic_to_enu(ll[:, 1], ll[:, 0], np.asarray(elev(ll[:, 1], ll[:, 0]), np.float64))
-        pts = np.ascontiguousarray(np.stack([np.asarray(e), np.asarray(n), np.asarray(z)], -1), np.float64)
+        e, n = _off_roads(frame, md, np.asarray(e, np.float64), np.asarray(n, np.float64), ll)
+        la2, lo2, _ = frame.enu_to_geodetic(e, n, np.zeros(len(e)))
+        la2, lo2 = np.asarray(la2, np.float64), np.asarray(lo2, np.float64)
+        _, _, z = frame.geodetic_to_enu(la2, lo2, np.asarray(elev(la2, lo2), np.float64))
+        pts = np.ascontiguousarray(np.stack([e, n, np.asarray(z)], -1), np.float64)
         off = np.cumsum([0] + [len(r) for _, r in lines]).astype(np.int64)
         stop = np.zeros(len(pts), bool)
         for _, rings in subs:

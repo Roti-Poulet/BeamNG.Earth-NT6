@@ -13,8 +13,10 @@ own. Mods call it from a Vue mod entry `/ui/ui-vue/mods/<mod>/index.js` (`onLoad
 using BngSwitch / BngSlider / BngButton from `@/common/components/base`).
 
 BeamNG.Earth uses that:
-- a button **"BeamNG.Earth"** in the shared Mods tab (where users look), opening our settings page;
-  later its own tab once there are several pages (Settings, World Map, Dev Tools);
+- a tab of our own, **"BeamNG.Earth"** (since 2026-10-28, as BeamMP does): one side button per settings page
+  (EarthSettingsPage.vue with props {page}), EarthSettingsSide.vue (connection, help) as the tab's second card; the
+  same pages as a full page of their own (route beamngEarthSettings, EarthSettings.vue) for the main menu. The
+  schema and the shared state are in earthSettingsStore.js;
 - **Settings page** (Vue, `/ui/ui-vue/mods/beamngEarth/EarthSettings.vue`): server connection and
   session, rebase distance, view distance mode (real horizon / fixed km) and haze strength, detail
   level / streaming budget (when the M3 controller exists), sky mode (real time / manual) and the time
@@ -253,7 +255,7 @@ level after a console teleport).
   Go / Rename (inline field, OK / Cancel) / Delete (the button reads "Confirm" for 4 s), and the
   recent places (name or lat/lon, "level start" tag) with Go / Save (Go sends the row's lat/lon
   with its index, so a double click cannot land on the row that moved up). Go is disabled with a note
-  ("Companion server not connected", "No player vehicle") when it cannot teleport; errors and
+  ("Companion server not connected", "Load the BeamNG.Earth level first") when it cannot teleport; errors and
   "Going to ..." show in a line at the top. BngInput fields (`v-bng-text-input`, so typing does not
   drive the car), BngButton text buttons, no glyphs, no ::before / ::after. The 2 s poll also
   refreshes the lists (`uiPlaces`), so a teleport from the console or the level start shows up.

@@ -150,6 +150,8 @@ def tile_chunks(frame, tx, ty, cells):
             # nothing on open ground
             got = railways.drawn(feats, i) if str(sub[i]) == "rail" else None
             meshed = got is not None
+            if str(sub[i]) == "rail" and not meshed and str(cls[i]) != "tram":
+                continue
             kind = KINDS.get(got[0] if meshed else str(cls[i])) if str(sub[i]) == "rail" else None
             if str(sub[i]) == "road":
                 if specs is None:

@@ -149,4 +149,129 @@ for _, o in ipairs(S.liveOf('TSStatic')) do o:delete() end             -- (the l
 G.prewarm({ '/x/a.dae' })
 T.check(#S.liveOf('TSStatic') == 1, 'made again after the level went')
 
+-- a big station (the Buc-ee's in New Braunfels: 354 props, 23.8 ms in one frame) spawns over several frames: one
+-- object a governor slot, made (POIs, the collision rebuild) only once all of it is there
+local budget = 0
+local gov10 = { try = function() if budget > 0 then budget = budget - 1 return true end return false end,
+                charge = function() end }
+local function frame() budget = 10; G.update(gov10) end
+local function big(id, x)
+  local r = rec(id, x)
+  local p1 = r.props[1]
+  r.props = {}
+  for i = 1, 40 do
+    r.props[i] = { shape = p1.shape, pos = { (x or 0) + i, 5, 1 }, yaw = 0, scale = { 1, 1, 1 }, collide = (i % 2 == 0) }
+  end
+  return r
+end
+G.reset()
+for _, o in ipairs(S.liveOf('TSStatic')) do o:delete() end             -- (the prewarm's hidden shape above)
+collide = 0
+G.onRows(1, '1:7_7', { big('buc', 0) })
+frame()
+T.check(count('TSStatic') == 10, 'frame 1: 10 objects: ' .. count('TSStatic'))
+T.check(G.count() == 0 and collide == 0, 'not made yet, no collision rebuild yet')
+frame(); frame(); frame()
+T.check(count('TSStatic') == 40 and count('BeamNGGameplayArea') == 0, 'frame 4: the props, no areas yet')
+frame()
+T.check(count('BeamNGGameplayArea') == 2 and count('BeamNGPointOfInterest') == 2, 'frame 5: the areas')
+T.check(G.count() == 1 and collide == 1, 'made once, one collision rebuild: ' .. collide)
+local els5 = {}
+G.pois('beamng_earth', els5)
+T.check(#els5 == 1, 'its POIs once made')
+
+-- dropped mid-spawn: what was made goes, with a collision rebuild (its pumps may be in the collision already)
+G.reset()
+collide = 0
+G.onRows(1, '1:7_8', { big('half', 0) })
+frame()
+G.dropKey('1:7_8')
+T.check(count('TSStatic') == 0, 'the half-made station gone')
+T.check(collide == 1, 'a collision rebuild after deleting it')
+frame()
+T.check(count('TSStatic') == 0, 'nothing more made after the drop')
+
+-- a rebase mid-spawn: the objects made move with the world; the rest wait for the new frame's record
+G.reset()
+G.onRows(1, '1:7_9', { big('reb', 0) })
+frame()
+local first = scenetree.findObject and S.liveOf('TSStatic')[1]
+local y0 = first.pos.y
+G.transform(xf)
+T.near(first.pos.y, y0 - 20, 1e-9, 'a made object moved by the transform')
+frame()
+T.check(count('TSStatic') == 10, 'nothing more from the old frame record')
+G.onRows(2, '2:7_9', { big('reb', 0) })      -- the new anchor's tile
+for _ = 1, 5 do frame() end
+T.check(count('TSStatic') == 40 and G.count() == 1, 'finished from the new record')
+G.reset()
+
+-- (final review) a road tile sent again while a big station is still spawning, with another layout: started again
+-- from the new record, not carried on into it (no prop doubled or missing)
+G.onRows(1, '1:5_5', { big('mid', 0) })
+frame()
+local shifted = big('mid', 100); table.remove(shifted.props)            -- 39 props, all elsewhere
+G.onRows(1, '1:5_6', { shifted })
+for _ = 1, 6 do frame() end
+local wrong = 0
+for _, o in ipairs(S.liveOf('TSStatic')) do
+  if o.pos.x < 100 then wrong = wrong + 1 end
+end
+T.check(count('TSStatic') == 39 and wrong == 0, 'all 39 from the new record, none left from the old: ' .. wrong)
+G.reset()
+
+-- a re-sent road tile whose record has a prop more or fewer (its neighbour's buildings arrived): the props kept by
+-- shape and place, only the difference made or deleted, so nothing blinks; the refuel areas (invisible) made again
+-- when they change
+local function ids()
+  local out = {}
+  for _, o in ipairs(S.liveOf('TSStatic')) do out[o:getID()] = o.fields.shapeName end
+  return out
+end
+local function same(a, b, except)
+  for id in pairs(a) do if id ~= except and not b[id] then return false end end
+  return true
+end
+G.onRows(1, '1:6_6', { rec('rs', 0) }); G.update(gov)
+local before3 = ids()
+local queued = false
+local fewer = rec('rs', 0); table.remove(fewer.props, 2)
+collide = 0
+G.onRows(1, '1:6_7', { fewer })
+T.check(count('TSStatic') == 1, 'one prop fewer: one object deleted at once: ' .. count('TSStatic'))
+local after = ids()
+local kept = next(after)
+T.check(before3[kept] ~= nil, 'the other prop kept (same object)')
+G.update(gov)
+T.check(count('TSStatic') == 1 and count('BeamNGGameplayArea') == 2, 'nothing respawned')
+T.check(collide == 1, 'one collision rebuild for the deleted prop')
+local more = rec('rs', 0)
+more.props[3] = { shape = '/levels/west_coast_usa/art/shapes/buildings/s_fuel_structure_07.dae', pos = { 6, 0, 1 }, yaw = 90,
+  scale = { 1, 1, 1 }, collide = true }
+G.onRows(1, '1:6_8', { more })
+T.check(count('TSStatic') == 3, 'a prop more (and the one back): made at once: ' .. count('TSStatic'))
+T.check(ids()[kept] ~= nil, 'the kept prop still the same object')
+local areaIds = {}
+for _, o in ipairs(S.liveOf('BeamNGGameplayArea')) do areaIds[o:getID()] = true end
+local moreAreas = rec('rs', 0)
+moreAreas.props[3] = more.props[3]
+moreAreas.areas[3] = { pos = { 6, 0, 2 }, yaw = 90, half = { 1.6, 2.2, 2.75 }, icon = { 6, 0, 4.5 } }
+local propIds = ids()
+local c3 = clears
+G.onRows(1, '1:6_9', { moreAreas })
+T.check(count('BeamNGGameplayArea') == 3 and count('BeamNGPointOfInterest') == 3, 'a pump more: its area and icon')
+T.check(scenetree.findObject('bne_fuel_rs_a3') ~= nil, 'named in order')
+T.check(same(propIds, ids()), 'no prop touched for an area change')
+clock = clock + G.CLEAR_S + 0.01; G.update(gov)
+T.check(clears == c3 + 1, 'the POIs gathered again')
+local els6 = {}
+G.pois('beamng_earth', els6)
+T.check(#els6 == 1 and #els6[1].data.facility.pumps == 3, 'three pumps in the POI')
+-- a record in another frame (nothing matches: the new anchor's tile after a rebase): made again, as before
+local moved = rec('rs', 500)
+G.onRows(2, '2:6_9', { moved }); G.update(gov)
+T.check(count('TSStatic') == 2, 'made again from the new frame: ' .. count('TSStatic'))
+T.near(scenetree.findObject('bne_fuel_rs_a1').pos.x, 502, 1e-9, 'at the new place')
+G.reset()
+
 T.done('test_gasstations')

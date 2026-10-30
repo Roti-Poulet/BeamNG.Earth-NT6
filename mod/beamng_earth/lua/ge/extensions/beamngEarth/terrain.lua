@@ -27,7 +27,14 @@ M.SIZE = lattice.N              -- samples per side (configure); the layer map h
 M.SQUARE_SIZE = lattice.SQUARE  -- 2.0 m
 M.MATERIAL = 'beamngEarthDirt'
 M.TEXTURE_SET = 'beamngEarthTerrainMaterialTextureSet'
-M.BASE_TEX_SIZE = 1024   -- = the level texture set's base slot (tools/make_level_assets.py BASE_TEX)
+M.BASE_TEX_SIZE = 2048   -- = the level texture set's base slot (tools/make_level_assets.py BASE_TEX): the size in use
+-- The ground photo sizes (the graphics setting groundPhoto; server earthd.BASE_SIZES): the level ships the flat base
+-- maps of each (tools/make_level_assets.py: 2048's under the plain names, the others with a _<px> suffix). The size is
+-- chosen before a level's first block (setPhotoSize; the texture set, every layer's base maps and the block's
+-- baseTexSize follow it at getOrCreate); a change while the block exists waits for the next level load.
+M.BASE_DEFAULT = 2048
+M.BASE_SIZES = { [1024] = true, [2048] = true, [4096] = true }
+local wantBase = M.BASE_DEFAULT
 
 local TERRAIN_DIR = '/levels/beamng_earth/art/terrains/'
 local TERRAIN_DIR_BASE = TERRAIN_DIR .. 'bngEarth_base_b.png'   -- the level's flat base colour
@@ -198,6 +205,7 @@ local function getOrCreate()
   local tb = M.get()
   if tb then return tb end
   ensureMaterials()
+  M.applyBaseSize(wantBase)      -- (the settings' ground photo size, before the block: it sizes its base textures)
   tb = TerrainBlock()
   tb:setName(M.NAME)
   -- the resolution the engine bakes the block's base colour at (default 1024; West Coast USA's block 2048;
@@ -218,6 +226,62 @@ local function getOrCreate()
   end)
   if not ok then log('W', 'beamngEarth', 'terrain addMaterial failed: ' .. tostring(err)) end
   return tb
+end
+
+-- Pure: the level flat base map `path` at ground photo size n (another path: as it is).
+function M.baseMapFor(path, n)
+  if type(path) ~= 'string' then return path end
+  local stem = path:match('^(.*/bngEarth_base_%a+)_%d+%.png$') or path:match('^(.*/bngEarth_base_%a+)%.png$')
+  if not stem then return path end
+  return n == M.BASE_DEFAULT and (stem .. '.png') or (stem .. '_' .. tostring(n) .. '.png')
+end
+
+-- The ground photo size to use (the settings page's groundPhoto): at once when no block exists, else from the next
+-- level's first block. Returns the size the server should build at now (photoSize).
+function M.setPhotoSize(n)
+  n = tonumber(n)
+  if n and M.BASE_SIZES[n] then wantBase = n end
+  return M.photoSize()
+end
+
+-- The ground photo size of the block now, or the one the next block will have (none yet).
+function M.photoSize()
+  if M.get() then return M.BASE_TEX_SIZE end
+  return wantBase
+end
+
+local BASE_MAP_FIELDS = { 'aoBaseTex', 'baseColorBaseTex', 'heightBaseTex', 'normalBaseTex', 'roughnessBaseTex' }
+-- The texture set's base slot and our layers' flat base maps at size n (before the block exists: the engine sizes
+-- the block's base textures when it is added; a map unlike the slot is resized at every material rebuild).
+-- Returns how many fields changed (0: already so).
+function M.applyBaseSize(n)
+  local changed = 0
+  local set = scenetree.findObject(M.TEXTURE_SET)
+  local want = tostring(n) .. ' ' .. tostring(n)
+  if set then
+    local ok, cur = pcall(function() return set:getField('baseTexSize', 0) end)
+    if not ok or tostring(cur) ~= want then
+      pcall(function() set:setField('baseTexSize', 0, want) end)
+      changed = changed + 1
+    end
+  end
+  local names = scenetree.findClassObjects and scenetree.findClassObjects('TerrainMaterial') or {}
+  for _, name in ipairs(names) do
+    if name == M.MATERIAL or tostring(name):sub(1, 8) == 'bngEarth' then
+      local m = scenetree.findObject(name)
+      for _, f in ipairs(BASE_MAP_FIELDS) do
+        local ok, v = pcall(function() return m:getField(f, 0) end)
+        local nv = ok and M.baseMapFor(v, n) or nil
+        if nv and nv ~= v then m:setField(f, 0, nv); changed = changed + 1 end
+      end
+    end
+  end
+  M.BASE_TEX_SIZE = n
+  M.LEVEL_BASE.tex = M.baseMapFor(TERRAIN_DIR_BASE, n)
+  if changed > 0 then
+    log('I', 'beamngEarth', string.format('terrain: ground photo %d px (%d fields set)', n, changed))
+  end
+  return changed
 end
 
 -- Apply the render flag to the block. Terrain mode never calls the engine unless the flag was off

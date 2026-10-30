@@ -146,5 +146,105 @@ class AisleTest(unittest.TestCase):
         self.assertEqual(parking.aisle_spots([street], {"a"}, (0, 0, 256, 256)), [])
 
 
+def _z(*_a, **_k):
+    return np.zeros(len(_a[0]))
+
+
+class MarkTest(unittest.TestCase):
+    LOT = np.array([(0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0)])
+
+    def _dividers(self, chunks):
+        return [c for c in chunks if abs(c["n"][0][0] - c["n"][1][0]) < 0.05]
+
+    def test_stall_lines_follow_the_rows(self):
+        chunks = parking.lot_markings([self.LOT], (0, 0, 256, 256), _z)
+        self.assertGreater(len(chunks), 40)
+        self.assertTrue(all(c["m"] == "line_white" and c["w"] == 0.1 for c in chunks))
+        divs = self._dividers(chunks)
+        self.assertGreater(len(divs), 20)
+        for c in divs:
+            self.assertAlmostEqual(abs(c["n"][0][1] - c["n"][1][1]), parking.LOT_SPOT_D_M, delta=0.05)
+            self.assertTrue(0.5 < c["n"][0][1] < 39.5 and 0.5 < c["n"][1][1] < 39.5)
+        xs = sorted({round(c["n"][0][0], 2) for c in divs})
+        self.assertTrue(np.all(np.abs(np.diff(xs) - parking.LOT_SPOT_W_M) < 0.05))
+        keys = []
+        for c in chunks:
+            a = (round(c["n"][0][0], 2), round(c["n"][0][1], 2))
+            b = (round(c["n"][1][0], 2), round(c["n"][1][1], 2))
+            keys.append(tuple(sorted((a, b))))
+        self.assertEqual(len(keys), len(set(keys)), "a shared head line drawn once")
+
+    def test_a_building_takes_its_half(self):
+        garage = np.array([(0.0, 0.0), (30.0, 0.0), (30.0, 40.0), (0.0, 40.0)])
+        chunks = parking.lot_markings([self.LOT], (0, 0, 256, 256), _z, [garage])
+        self.assertTrue(chunks)
+        for c in chunks:
+            mx = (c["n"][0][0] + c["n"][1][0]) / 2
+            self.assertGreater(mx, 29.0)
+
+    def test_neighbouring_tiles_share_no_divider(self):
+        a = parking.lot_markings([self.LOT], (0, 0, 30, 256), _z)
+        b = parking.lot_markings([self.LOT], (30, 0, 256, 256), _z)
+        whole = parking.lot_markings([self.LOT], (0, 0, 256, 256), _z)
+
+        def key(c):
+            p, q = c["n"]
+            return (round(p[0], 2), round(p[1], 2), round(q[0], 2), round(q[1], 2))
+
+        da, db, dw = self._dividers(a), self._dividers(b), self._dividers(whole)
+        self.assertFalse(set(map(key, da)) & set(map(key, db)))
+        self.assertEqual(sorted(map(key, da + db)), sorted(map(key, dw)))
+
+    def test_aisle_lines_both_sides_and_off_a_crossing_street(self):
+        aisle = ("a", roads.Spec(6.0, "paved", True, "service", False),
+                 np.array([(0.0, 50.0, 1.0), (80.0, 50.0, 1.0)]), 0.0)
+        chunks = parking.aisle_markings([aisle], {"a"}, (0, 0, 256, 256))
+        north = [c for c in self._dividers(chunks) if min(c["n"][0][1], c["n"][1][1]) > 50]
+        south = [c for c in self._dividers(chunks) if max(c["n"][0][1], c["n"][1][1]) < 50]
+        self.assertTrue(len(north) > 10 and len(south) > 10)
+        for c in north:
+            y0, y1 = sorted((c["n"][0][1], c["n"][1][1]))
+            self.assertAlmostEqual(y0, 53.0, delta=0.05)
+            self.assertAlmostEqual(y1, 53.0 + parking.LOT_SPOT_D_M, delta=0.05)
+        street = ("s", roads.Spec(8.0, "paved", True, "residential", False),
+                  np.array([(40.0, 0.0, 0.0), (40.0, 100.0, 0.0)]), 0.0)
+        crossed = parking.aisle_markings([aisle, street], {"a"}, (0, 0, 256, 256))
+        for c in crossed:
+            for x, y, _z in c["n"]:
+                self.assertGreater(abs(x - 40.0), 4.0)
+        self.assertEqual(parking.aisle_markings([street], {"a"}, (0, 0, 256, 256)), [])
+
+    def test_a_mapped_lot_hides_the_aisle_lines_on_it(self):
+        line = {"m": "line_white", "w": 0.1, "tl": 6.4, "p": 2, "n": [[10.0, 10.0, 0.0], [12.0, 10.0, 0.0]]}
+        out = {"m": "line_white", "w": 0.1, "tl": 6.4, "p": 2, "n": [[80.0, 80.0, 0.0], [82.0, 80.0, 0.0]]}
+        kept = parking.drop_covered([line, out], [self.LOT])
+        self.assertEqual(kept, [out])
+
+    def test_tile_collects_aisle_lines_only_when_asked(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_roads import FRAME, features, flat, rules
+        f = features([[(0, 50), (80, 50)]], ["service"], ids=["a"])
+        f.rules["subclass"] = rules([(0, "parking_aisle")])
+        marks = []
+        chunks = roads.build_tile(FRAME, 0, 0, [f], flat, marks=marks)
+        self.assertTrue(marks)
+        self.assertTrue(all(c["m"] == "line_white" for c in marks))
+        self.assertFalse([c for c in chunks if c.get("m") == "line_white" and c.get("w") == 0.1])
+        bare = roads.build_tile(FRAME, 0, 0, [f], flat)
+        self.assertEqual([c.get("m") for c in bare], [c.get("m") for c in chunks])
+
+    def test_a_parking_aisle_has_no_gravel_edge(self):
+        # (it runs through a paved lot: a dirt strip stood on the asphalt between the stall rows)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_roads import FRAME, features, flat, rules
+        f = features([[(0, 50), (80, 50)]], ["service"], ids=["a"])
+        plain = roads.build_tile(FRAME, 0, 0, [f], flat)
+        f.rules["subclass"] = rules([(0, "parking_aisle")])
+        aisle = roads.build_tile(FRAME, 0, 0, [f], flat)
+        edge = roads.EDGE_DECAL["m"]
+        self.assertTrue([c for c in plain if c.get("m") == edge])
+        self.assertFalse([c for c in aisle if c.get("m") == edge])
+
+
 if __name__ == "__main__":
     unittest.main()

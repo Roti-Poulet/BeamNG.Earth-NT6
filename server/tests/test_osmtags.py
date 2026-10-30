@@ -77,6 +77,19 @@ class SpecTest(unittest.TestCase):
         g = features([[(0, 0), (200, 0)]], ["unknown"])
         self.assertIsNotNone(roads.road_specs(g)[0])
 
+    def test_overture_s_under_construction_flag_over_most_of_it_is_not_built(self):
+        """The Gotthard road tunnel's second bore (highway=construction until ~2029) came with the open tunnel's tags
+        (Layercake has no construction ways) and Overture's is_under_construction flag: it was drawn beside the real
+        bore, its portal in the A2's lanes. Flagged over a short stretch (roadworks): drawn."""
+        f = features([[(0, 0), (200, 0)], [(0, 30), (200, 30)], [(0, 60), (200, 60)]], ["trunk"] * 3,
+                     flags=[(0, "is_under_construction"), (1, "is_under_construction", 0.1, 0.2), (2, "is_tunnel")])
+        self.assertTrue(roads.unbuilt(f, 0))
+        self.assertFalse(roads.unbuilt(f, 1))
+        self.assertFalse(roads.unbuilt(f, 2))
+        specs = roads.road_specs(f)
+        self.assertIsNone(specs[0])
+        self.assertIsNotNone(specs[1])
+
     def test_osm_width_is_the_width(self):
         f = tagged([[(0, 0), (200, 0)]], ["residential"], ["w1@1"], {1: {"width": 9.0, "lanes": 2}})
         self.assertAlmostEqual(roads.road_specs(f)[0].width, 9.0)
@@ -96,6 +109,97 @@ class SpecTest(unittest.TestCase):
         self.assertEqual(navgraph._lanes(7.0, True, 3), (3, 0))
         self.assertEqual(navgraph._lanes(7.0, False), navgraph._lanes(7.0, False, None))
 
+
+
+class OsmAheadOfClassTest(unittest.TestCase):
+    """Lane counts and widths follow OpenStreetMap ahead of the class's defaults (the user, 2026-10-27: "it leans on
+    the road's class definition more than the road's actual metadata")."""
+
+    def box(self, x0, x1, y=0.0):
+        from test_roads import LAT, LON, M_LAT, M_LON
+        return {"bx0": LON + x0 / M_LON, "by0": LAT + (y - 5) / M_LAT, "bx1": LON + x1 / M_LON,
+                "by1": LAT + (y + 5) / M_LAT}
+
+    def test_way_without_lanes_takes_the_same_named_way_going_the_same_way(self):
+        f = features([[(0, 0), (100, 0)], [(100, 0), (200, 0)], [(0, 300), (100, 300)], [(200, 0), (300, 0)]],
+                     ["secondary"] * 4)
+        f.attrs["src_record"] = np.array(["w1@1", "w2@1", "w3@1", "w4@1"])
+        f.attrs["name"] = np.array(["Main"] * 4)
+        tags = {1: dict(self.box(0, 210), name="Main", lanes=4), 2: dict(self.box(100, 200), name="Main"),
+                3: dict(self.box(0, 100, 300), name="Main"),
+                4: dict(self.box(200, 300), name="Main", osm_oneway="yes")}
+        osmtags.join(f, tags)
+        self.assertEqual(f.attrs["osm_lanes"][1], 4, "the untagged way of the street takes its count")
+        self.assertTrue(np.isnan(f.attrs["osm_lanes"][2]), "the same name 300 m off: none")
+        self.assertTrue(np.isnan(f.attrs["osm_lanes"][3]), "a one-way does not take a two-way's count")
+
+    def test_a_two_way_with_lanes_is_not_made_a_divided_carriageway(self):
+        """Portland's Rosa Parks Way: two two-way ways of one name 20 m apart, lanes=3 each (1 + 1 + a turn lane),
+        were made one-way carriageways of 3 lanes each."""
+        f = tagged([[(0, 0), (300, 0)], [(300, 20), (0, 20)]], ["primary"] * 2, ["w1@1", "w2@1"],
+                   {1: {"lanes": 3}, 2: {"lanes": 3}})
+        f.attrs["name"] = np.array(["Rosa Parks Way"] * 2)
+        for sp in roads.road_specs(f):
+            self.assertFalse(sp.oneway)
+            self.assertEqual(navgraph._lanes(navgraph.driving_width(sp), False, sp.lanes), (1, 1))
+
+    def test_bridge_without_lanes_takes_the_same_named_way_count(self):
+        """GitHub #378: a bridge drawn at its class's 8 m instead of OSM's 4 lanes. Here the bridge's own way has no
+        lane count; it takes the street's (4), and the deck is as wide as 4 lanes."""
+        f = features([[(-300, 0), (-100, 0)], [(-100, 0), (100, 0)]], ["primary"] * 2,
+                     levels=[(1, 1.0, 0.0, 1.0)])
+        f.attrs["src_record"] = np.array(["w1@1", "w2@1"])
+        f.attrs["name"] = np.array(["Kommunalny"] * 2)
+        osmtags.join(f, {1: dict(self.box(-300, -90), name="Kommunalny", lanes=4),
+                         2: dict(self.box(-100, 100), name="Kommunalny")})
+        sp = roads.bridge_specs(f)[1]
+        self.assertEqual(sp.lanes, 4)
+        self.assertGreaterEqual(sp.width, 4 * roads.LANE_W.get("primary", roads.LANE_W_DEFAULT))
+
+    def test_relation_segment_takes_the_two_way_count_not_split(self):
+        """GitHub #175 (Kostiantynivka, vul. Konrada Hampera): a relation segment (no way id) beside the same street's
+        two-way 4-lane way, a one-way 1-lane ramp and an untagged side piece was drawn as one 3.5 m one-way lane: the road narrowed
+        sharply. It takes the two-way's 4 lanes and stays two-way."""
+        f = features([[(0, 0), (100, 0), (200, 0)], [(200, 0), (400, 0)], [(0, 10), (200, 10)], [(50, 0), (150, 0)]],
+                     ["secondary", "secondary", "secondary", "unclassified"])
+        f.attrs["src_record"] = np.array(["r9@1", "w1@1", "w2@1", "w3@1"])
+        f.attrs["name"] = np.array(["Hampera"] * 4)
+        osmtags.join(f, {1: dict(self.box(0, 400), name="Hampera", lanes=4),
+                         2: dict(self.box(0, 200, 10), name="Hampera", lanes=1, osm_oneway="yes"),
+                         3: dict(self.box(50, 150), name="Hampera")})    # (the smallest around it: no count)
+        self.assertEqual(f.attrs["osm_lanes"][0], 4)
+        sp = roads.road_specs(f)[0]
+        self.assertFalse(sp.oneway)
+        self.assertGreaterEqual(sp.width, 4 * roads.LANE_W.get("secondary", roads.LANE_W_DEFAULT))
+
+    def test_driving_width_follows_the_lane_count(self):
+        sp = tagged([[(0, 0), (200, 0)]], ["residential"], ["w1@1"], {1: {"lanes": 4}})
+        sp = roads.road_specs(sp)[0]
+        self.assertAlmostEqual(navgraph.driving_width(sp), 4 * roads.LANE_W_DEFAULT, "not the class's 2 lanes")
+
+    def test_measured_width_does_not_override_the_lane_count(self):
+        f = tagged([[(0, 0), (200, 0)]], ["secondary"], ["w1@1"], {1: {"lanes": 4}})
+        sp = roads.road_specs(f, None, lambda fid, ll: (7.0, 2.0))[0]
+        self.assertGreaterEqual(sp.width, 4 * roads.LANE_W["secondary"])
+
+
+class OnewayJoinTest(unittest.TestCase):
+    def test_one_way_end_moves_to_its_own_lane_of_the_two_way(self):
+        """A one-way (north) ending on a two-way's centre line moves right of its travel by a quarter of the two-way's
+        width, faded along it; its other end, on another one-way, stays."""
+        import oneway_joins
+        from test_roads import M_LON
+        f = features([[(-100, 0), (0, 0), (100, 0)], [(0, -60), (0, -30), (0, 0)], [(0, -60), (40, -60)]],
+                     ["secondary", "residential", "residential"])
+        f.attrs["osm_oneway"] = np.array(["", "yes", "yes"])
+        f.attrs["osm_lanes"] = np.array([4.0, np.nan, np.nan])
+        x0 = f.lonlat[:, 0].copy()
+        self.assertEqual(oneway_joins.apply(f), 1)
+        dx = (f.lonlat[:, 0] - x0) * M_LON
+        self.assertAlmostEqual(dx[5], min(4 * oneway_joins.LANE_M / 4, oneway_joins.MAX_SHIFT_M), places=3)
+        self.assertEqual(dx[4], 0.0, "30 m along: past the fade")
+        self.assertEqual(dx[3], 0.0, "the end on the other one-way stays")
+        self.assertTrue(np.all(dx[:3] == 0.0), "the two-way stays")
 
 class RacewayTest(unittest.TestCase):
     """GitHub #143: OpenStreetMap's raceways appended to Overture's roads (which have none), drawn as 12 m paved

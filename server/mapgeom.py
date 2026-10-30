@@ -18,7 +18,7 @@ order dependence (features come sorted by id from the reader).
 """
 import math
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -226,6 +226,39 @@ class Features:
                 rules.setdefault(name, {})[col] = arrays[k]
         f.rules = {k: RuleTable(v["feature"], v["value"], v["start"], v["end"]) for k, v in sorted(rules.items())}
         return f
+
+
+def drop_huge(f, max_m2):
+    """f with every polygon whose outer ring encloses more than max_m2 collapsed onto its first point (a ring of no
+    area: every reader leaves it out), or f itself when there is none. An OpenStreetMap "building" of 15.8 km2 roofed
+    a whole city in Egypt (GitHub #413); the largest real buildings are about 1 km2. Its ids, attrs and rules stay."""
+    n = len(f)
+    if not n or not len(f.lonlat):
+        return f
+    huge = []
+    for i in range(n):
+        if f.kind[i] != POLYGON or f.part_off[i + 1] == f.part_off[i]:
+            continue
+        r0 = f.ring_off[f.part_off[i]]
+        a, b = f.coord_off[r0], f.coord_off[r0 + 1]
+        if b - a < 3:
+            continue
+        ll = f.lonlat[a:b]
+        k = math.cos(math.radians(float(ll[:, 1].mean())))
+        x, y = ll[:, 0] * (111320.0 * k), ll[:, 1] * 110540.0
+        if 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) > max_m2:
+            huge.append(i)
+    if not huge:
+        return f
+    lonlat = np.array(f.lonlat, np.float64, copy=True)
+    en = None if f.en is None else np.array(f.en, np.float64, copy=True)
+    for i in huge:
+        a = f.coord_off[f.ring_off[f.part_off[i]]]
+        b = f.coord_off[f.ring_off[f.part_off[i + 1]]]
+        lonlat[a:b] = lonlat[a]
+        if en is not None:
+            en[a:b] = en[a]
+    return replace(f, lonlat=lonlat, en=en)
 
 
 def empty(layer):

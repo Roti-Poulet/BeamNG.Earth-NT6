@@ -34,54 +34,77 @@ local function place(o, pos, q)
 end
 
 local function deleteObjs(st)
+  local any = #st.objs > 0
   for _, ob in ipairs(st.objs) do
     local o = scenetree.findObjectById(ob.id)
     if o then o:delete() end
   end
-  -- its colliding pumps and canopy out of the collision too (no invisible pump left to crash into)
-  if st.made and M.onCollide then M.onCollide() end
-  st.objs, st.pumps, st.made = {}, {}, false
+  -- its colliding pumps and canopy out of the collision too (no invisible pump left to crash into); a station half
+  -- made (spawnStep) may have some in it already, by another rebuild
+  if any and M.onCollide then M.onCollide() end
+  st.objs, st.pumps, st.made, st.cursor = {}, {}, false, nil
 end
 
-local function spawn(id, st)
+-- a prop's identity across records of its station in one frame: its shape and its place to 0.5 m
+local function propKey(p)
+  return string.format('%s|%d|%d', p.shape, math.floor(p.pos[1] * 2 + 0.5), math.floor(p.pos[2] * 2 + 0.5))
+end
+
+local function makeProp(st, p)
+  local o = createObject('TSStatic')
+  o:setField('shapeName', 0, p.shape)
+  -- the shapes' own collision meshes (West Coast USA leaves its fuel shapes at the default, 'Collision Mesh'), not
+  -- their visible triangles: every collidable triangle costs each global collision rebuild (CLAUDE.md)
+  o:setField('collisionType', 0, p.collide and 'Collision Mesh' or 'None')
+  o:setField('decalType', 0, 'None')
+  o.canSave = false
+  local s = p.scale or { 1, 1, 1 }
+  o:setScale(vec3(s[1], s[2], s[3]))
+  local q = yawQuat(p.yaw)
+  place(o, p.pos, q)
+  o:registerObject('')
+  scenetree.MissionGroup:addObject(o)
+  st.objs[#st.objs + 1] = { id = o:getID(), pos = { p.pos[1], p.pos[2], p.pos[3] }, q = q, key = propKey(p) }
+end
+
+local function makeArea(id, st, i, a)
+  local an, inm = 'bne_fuel_' .. id .. '_a' .. i, 'bne_fuel_' .. id .. '_i' .. i
+  local ar = createObject('BeamNGGameplayArea')
+  ar.canSave = false
+  ar:setScale(vec3(a.half[1], a.half[2], a.half[3]))
+  local q = yawQuat(a.yaw)
+  place(ar, a.pos, q)
+  ar:registerObject(an)
+  scenetree.MissionGroup:addObject(ar)
+  local ic = createObject('BeamNGPointOfInterest')
+  ic.canSave = false
+  place(ic, a.icon, { 0, 0, 0, 1 })
+  ic:registerObject(inm)
+  scenetree.MissionGroup:addObject(ic)
+  st.objs[#st.objs + 1] = { id = ar:getID(), pos = { a.pos[1], a.pos[2], a.pos[3] }, q = q }
+  st.objs[#st.objs + 1] = { id = ic:getID(), pos = { a.icon[1], a.icon[2], a.icon[3] }, q = { 0, 0, 0, 1 } }
+  st.pumps[#st.pumps + 1] = { an, inm }
+end
+
+-- One step of a station's spawn: its next prop, or its next refuel area with its icon (st.cursor: the steps done). A
+-- big station (the Buc-ee's in New Braunfels: 354 props, 23.8 ms in one frame) so spreads over frames within the
+-- governor's budget, a step a slot. Made (its POIs, one collision rebuild) after its last step. True when done.
+local function spawnStep(id, st)
   local r = st.rec
-  for _, p in ipairs(r.props or {}) do
-    local o = createObject('TSStatic')
-    o:setField('shapeName', 0, p.shape)
-    -- the shapes' own collision meshes (West Coast USA leaves its fuel shapes at the default, 'Collision Mesh'), not
-    -- their visible triangles: every collidable triangle costs each global collision rebuild (CLAUDE.md)
-    o:setField('collisionType', 0, p.collide and 'Collision Mesh' or 'None')
-    o:setField('decalType', 0, 'None')
-    o.canSave = false
-    local s = p.scale or { 1, 1, 1 }
-    o:setScale(vec3(s[1], s[2], s[3]))
-    local q = yawQuat(p.yaw)
-    place(o, p.pos, q)
-    o:registerObject('')
-    scenetree.MissionGroup:addObject(o)
-    st.objs[#st.objs + 1] = { id = o:getID(), pos = { p.pos[1], p.pos[2], p.pos[3] }, q = q }
+  local props, areas = r.props or {}, r.areas or {}
+  local k = (st.cursor or 0) + 1
+  if k <= #props then
+    makeProp(st, props[k])
+  elseif k <= #props + #areas then
+    makeArea(id, st, k - #props, areas[k - #props])
   end
-  for i, a in ipairs(r.areas or {}) do
-    local an, inm = 'bne_fuel_' .. id .. '_a' .. i, 'bne_fuel_' .. id .. '_i' .. i
-    local ar = createObject('BeamNGGameplayArea')
-    ar.canSave = false
-    ar:setScale(vec3(a.half[1], a.half[2], a.half[3]))
-    local q = yawQuat(a.yaw)
-    place(ar, a.pos, q)
-    ar:registerObject(an)
-    scenetree.MissionGroup:addObject(ar)
-    local ic = createObject('BeamNGPointOfInterest')
-    ic.canSave = false
-    place(ic, a.icon, { 0, 0, 0, 1 })
-    ic:registerObject(inm)
-    scenetree.MissionGroup:addObject(ic)
-    st.objs[#st.objs + 1] = { id = ar:getID(), pos = { a.pos[1], a.pos[2], a.pos[3] }, q = q }
-    st.objs[#st.objs + 1] = { id = ic:getID(), pos = { a.icon[1], a.icon[2], a.icon[3] }, q = { 0, 0, 0, 1 } }
-    st.pumps[#st.pumps + 1] = { an, inm }
-  end
+  st.cursor = k
+  if k < #props + #areas then return false end
+  st.cursor = nil
   st.made = true
   poisDirty = true
   if M.onCollide then M.onCollide() end
+  return true
 end
 
 -- Re-place a made station's objects from a record of the same station (the same props and areas in the same order,
@@ -105,6 +128,56 @@ local function replace(st, r)
   poisDirty = true
 end
 
+-- A made station's new record in the same frame with another layout (a road tile sent again once a neighbour's
+-- buildings arrived: a prop more or fewer): the props kept by shape and place (propKey) and re-placed, the others
+-- deleted and the missing ones made at once, so nothing blinks; the refuel areas and icons (invisible) made again,
+-- named in the record's order. False, touching nothing, when no prop matches (another frame: made again, as before).
+local function relayout(id, st, r)
+  local pool, olds = {}, 0
+  for k, ob in ipairs(st.objs) do
+    if ob.key then
+      olds = olds + 1
+      pool[ob.key] = pool[ob.key] or {}
+      table.insert(pool[ob.key], k)
+    end
+  end
+  local props = r.props or {}
+  local hit = {}
+  for i, p in ipairs(props) do
+    local list = pool[propKey(p)]
+    if list and #list > 0 then hit[i] = table.remove(list, 1) end
+  end
+  if next(hit) == nil and (olds > 0 or #props > 0) then return false end
+  local old, changed = st.objs, false
+  local keep = {}
+  for _, k in pairs(hit) do keep[k] = true end
+  for k, ob in ipairs(old) do
+    if not keep[k] then                   -- (an unmatched prop, and every area and icon)
+      local o = scenetree.findObjectById(ob.id)
+      if o then o:delete() end
+      if ob.key then changed = true end
+    end
+  end
+  st.objs, st.pumps = {}, {}
+  for i, p in ipairs(props) do
+    local k = hit[i]
+    if k then
+      local ob, q = old[k], yawQuat(p.yaw)
+      ob.pos, ob.q = { p.pos[1], p.pos[2], p.pos[3] }, q
+      local o = scenetree.findObjectById(ob.id)
+      if o then place(o, ob.pos, q) end
+      st.objs[#st.objs + 1] = ob
+    else
+      makeProp(st, p)
+      changed = true
+    end
+  end
+  for i, a in ipairs(r.areas or {}) do makeArea(id, st, i, a) end
+  poisDirty = true
+  if changed and M.onCollide then M.onCollide() end
+  return true
+end
+
 -- A road tile's stations (server roads_tile `fuel`).
 function M.onRows(aid, key, recs)
   if type(recs) ~= 'table' or not M.enabled then return end
@@ -118,12 +191,26 @@ function M.onRows(aid, key, recs)
         st.keys[key] = true
         if st.made and #(st.rec.props or {}) == #(r.props or {}) and #(st.rec.areas or {}) == #(r.areas or {}) then
           replace(st, r)
+        elseif st.made and relayout(r.id, st, r) then   -- another layout in this frame: the difference only
         elseif st.made then         -- another layout (the new anchor's frame): made again from this record
           deleteObjs(st)
           queue[#queue + 1] = r.id
           poisDirty = true
         elseif st.stale then        -- queued at a rebase: now it has a record in the current frame
+          -- (half made with another layout: made again from this record; with the same, finished from it)
+          if st.cursor and (#(st.rec.props or {}) ~= #(r.props or {}) or #(st.rec.areas or {}) ~= #(r.areas or {})) then
+            deleteObjs(st)
+          end
           queue[#queue + 1] = r.id
+        elseif st.cursor then       -- still spawning (spawnStep), still queued: a record in this frame
+          -- (with another layout: started again from it, not carried on into it; final review)
+          local a, b = st.rec.props or {}, r.props or {}
+          local same = #a == #b and #(st.rec.areas or {}) == #(r.areas or {})
+          for i = 1, math.min(st.cursor, #a) do
+            if not same then break end
+            same = propKey(a[i]) == propKey(b[i])
+          end
+          if not same then deleteObjs(st) end
         end
         st.rec, st.stale = r, nil
       end
@@ -145,15 +232,25 @@ function M.dropKey(key)
   end
 end
 
--- Once per frame: spawn within the governor's budget, then the POI list gathered again if due.
+-- Once per frame: spawn within the governor's budget, a step a slot (spawnStep; the station at the queue's head until
+-- it is done), then the POI list gathered again if due.
 function M.update(gov)
-  while #queue > 0 and gov:try('fuel') do
-    local id = table.remove(queue, 1)
+  while #queue > 0 do
+    local id = queue[1]
     local st = stations[id]
-    if st and not st.made and not st.stale then
+    if not st or st.made or st.stale then
+      table.remove(queue, 1)              -- (gone, made, or waiting for its record in a new frame: onRows queues it again)
+    else
+      if not gov:try('fuel') then break end
       local t0 = M.now()
-      local ok, err = pcall(spawn, id, st)
-      if not ok then log('W', 'beamngEarth', 'gas station ' .. tostring(id) .. ': ' .. tostring(err)) end
+      local ok, done = pcall(spawnStep, id, st)
+      if not ok then
+        log('W', 'beamngEarth', 'gas station ' .. tostring(id) .. ': ' .. tostring(done))
+        deleteObjs(st)
+        table.remove(queue, 1)
+      elseif done then
+        table.remove(queue, 1)
+      end
       gov:charge('fuel', (M.now() - t0) * 1000)
     end
   end

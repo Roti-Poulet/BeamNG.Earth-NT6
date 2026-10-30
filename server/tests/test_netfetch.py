@@ -109,6 +109,31 @@ def fetcher(script=None, policies=None, **kw):
     return f, clock, sleep, tr
 
 
+class ThroughputTest(unittest.TestCase):
+    """GitHub #241: map data at a crawl looked like stuck road workers; the status says the connection is slow."""
+
+    def test_large_responses_measure_the_connection(self):
+        big = b"x" * (1 << 20)
+        f, clock, _, _ = fetcher({USGS: [(200, {}, big, 10.0)]})            # 1 MiB in 10 s: ~0.1 MB/s
+        self.assertIsNone(f.throughput())
+        for n in range(3):
+            f.get(url(USGS, n))
+        self.assertAlmostEqual(f.throughput(), len(big) / 10.0 / 1e6, places=3)
+        self.assertIsNotNone(f.slow())
+        clock.advance(nf.RATE_WINDOW_S + 1)                                # (old samples age out)
+        self.assertIsNone(f.throughput())
+
+    def test_fast_or_small_responses_are_not_slow(self):
+        f, _, _, _ = fetcher({USGS: [(200, {}, b"x" * (1 << 20), 0.1)]})   # ~10 MB/s
+        for n in range(4):
+            f.get(url(USGS, n))
+        self.assertIsNone(f.slow())
+        g, _, _, _ = fetcher({USGS: [(200, {}, b"x" * 1000, 5.0)]})        # small and slow: latency, no sample
+        for n in range(4):
+            g.get(url(USGS, n))
+        self.assertIsNone(g.throughput())
+
+
 class TokenBucketTest(unittest.TestCase):
     def test_burst_then_rate(self):
         """N demand requests at t=0: `burst` less URGENT_TOKENS go at once, the rest 1/rate apart (the bucket keeps

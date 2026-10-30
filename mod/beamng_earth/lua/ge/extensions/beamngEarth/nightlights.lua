@@ -9,7 +9,8 @@ M.CHECK_S = 1.0
 -- the materials and their night glow (emissive factor, nits: West Coast USA's highrise windows glow at 200)
 M.MATERIALS = {
   bne_bld_facade = { '1 1 1', 200 },
-  bne_bld_office = { '0.95 0.97 1', 150 },
+  -- (offices: 150 nits drew Manhattan's curtain-wall towers as white lanterns, TGForever Discord 2026-10-28)
+  bne_bld_office = { '0.95 0.97 1', 70 },
   -- (shopfronts: their whole band lights up; at 320 nits, then 90, a grey-white strip along every street)
   bne_bld_shop = { '1 0.80 0.58', 30 },
   -- the skyline's walls (buildings.py _sky_mesh, tools/build_sky_windows.py: 1-3 miles off)
@@ -25,6 +26,11 @@ M.MATERIALS = {
 -- pool is made once (a few a frame) and only switched off by day. (After MihneaTeodorStoica's PR #340, which kept 24
 -- point lights within 90 m.) Farther lamps show their glow (furniture.py G_GLOW, out to where the road tiles end).
 M.LIGHTS_MAX = 128
+-- the quality setting's lamp light counts (settings.lua 'nightLights')
+M.QUALITY_LIGHTS = { few = 48, normal = 128, many = 256 }
+function M.setLightCount(level)
+  M.LIGHTS_MAX = M.QUALITY_LIGHTS[level] or M.QUALITY_LIGHTS.normal
+end
 M.LIGHTS_S = 0.25
 M.NEAR_M = 900
 M.AROUND_M = 60

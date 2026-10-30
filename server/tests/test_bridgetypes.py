@@ -226,9 +226,23 @@ class SpanTest(unittest.TestCase):
             L = bt.SPAN_SHARE * 400
             self.assertAlmostEqual(z.max(), 50.0 + share * L, delta=0.05 * share * L + 1.0)
 
-    def test_movable_and_plain_draw_nothing(self):
-        for info in (None, {"type": bt.NBI_BASCULE, "span": 50.0, "src": "nbi"}):
-            self.assertEqual(bt.structure_members([deck()], info, self.flat, self.wet), ([], []))
+    def test_plain_draws_nothing(self):
+        self.assertEqual(bt.structure_members([deck()], None, self.flat, self.wet), ([], []))
+        self.assertEqual(bt.structure_members([deck()], {"type": bt.PLAIN, "span": 50.0, "src": "nbi"}, self.flat,
+                                              self.wet), ([], []))
+
+
+class SparseTwinTest(unittest.TestCase):
+    def test_tower_spans_a_sparse_twin_carriageway(self):
+        # a suspension span's ways can run a kilometre between nodes: the twin is beside it at the tower, though its
+        # nearest node is 500 m off (a leg stood in its lanes on 25 de Abril and the Bay Bridge)
+        import numpy as np
+        import bridgetypes as bt
+        a = (np.array([[0.0, 0.0], [1000.0, 0.0]]), np.array([60.0, 60.0]), 12.0)
+        b = (np.array([[0.0, 20.0], [1000.0, 20.0]]), np.array([60.0, 60.0]), 12.0)
+        P, arcs, tans = bt._prep([a, b])
+        _, _, _, lo, hi, _, _ = bt._station(P, tans, 0, 500.0, arcs)
+        self.assertTrue(lo < -6.0 and hi > 26.0, (lo, hi))
 
 
 if __name__ == "__main__":

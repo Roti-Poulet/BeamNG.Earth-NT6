@@ -151,6 +151,7 @@ def grade_plans(frame, cells, box, elev):
         return out
     pad = GRADE_HALF_M + 15.0
     out = []
+    tunnels = tunnels + coarse_underpasses(frame, cells, box, rails, GRADE_REACH_M)
     for (fid, _c, kind, xy), (zb, _zg) in zip(rails, profile(rails, ground, tunnels)):
         if kind != "ground":
             continue
@@ -250,6 +251,65 @@ def road_underpasses(frame, cells, box, reach=REACH_M):
                 if key not in seen:
                     seen.add(key)
                     out.append((xy, sp.width / 2 + UNDERPASS_SIDE_M))
+    return out
+
+
+# Where the elevation is only the coarse global model (dem.coarse_at; the server sets COARSE_AT to its Dem's), a rail
+# bridge over a ground road stands on an embankment the 30 m data smeared away: the track is raised over the road (its
+# piece COARSE_PIECE_M either side of the crossing, as a tunnel's mouths) and ramps at GRADE, and the road stays at
+# grade (grading leaves rail spans alone there). Perm, GitHub #414: the underpass rule dug Первомайская улица 7.5 m
+# under the Балмошная–Лёвшино line, a walled trench 400 m long where the street is at grade under an embankment.
+COARSE_AT = None
+COARSE_PIECE_M = 25.0
+
+
+def _coarse_here(frame, box):
+    if COARSE_AT is None:
+        return False
+    try:
+        la, lo, _ = frame.enu_to_geodetic(0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3]), 0.0)
+        return bool(COARSE_AT(float(la), float(lo)))
+    except Exception:
+        return False
+
+
+def _seg_hits(a, b):
+    """Arc positions along polyline a where it crosses polyline b (proper segment intersections). Pure."""
+    out = []
+    sa = _arc(a)
+    for i in range(len(a) - 1):
+        p, r = a[i], a[i + 1] - a[i]
+        for j in range(len(b) - 1):
+            q, t = b[j], b[j + 1] - b[j]
+            den = r[0] * t[1] - r[1] * t[0]
+            if abs(den) < 1e-12:
+                continue
+            u = ((q[0] - p[0]) * t[1] - (q[1] - p[1]) * t[0]) / den
+            v = ((q[0] - p[0]) * r[1] - (q[1] - p[1]) * r[0]) / den
+            if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                out.append(float(sa[i] + u * (sa[i + 1] - sa[i])))
+    return out
+
+
+def coarse_underpasses(frame, cells, box, rails, reach=REACH_M):
+    """[(xy, half width)] (as road_underpasses): on coarse elevation (COARSE_AT), each ground road's piece
+    COARSE_PIECE_M either side of where a rail bridge part crosses it."""
+    bridges = [xy for (_fid, _c, kind, xy) in rails if kind == "bridge" and len(xy) >= 2]
+    if not bridges or not _coarse_here(frame, box):
+        return []
+    out = []
+    for line, half in crossings(frame, cells, box, reach):
+        if len(line) < 2:
+            continue
+        sl = _arc(line)
+        for b in bridges:
+            for sc in _seg_hits(line, b):
+                a0, a1 = max(0.0, sc - COARSE_PIECE_M), min(float(sl[-1]), sc + COARSE_PIECE_M)
+                if a1 - a0 < 1.0:
+                    continue
+                ss = np.linspace(a0, a1, max(3, int((a1 - a0) / STEP_M) + 1))
+                piece = np.c_[np.interp(ss, sl, line[:, 0]), np.interp(ss, sl, line[:, 1])]
+                out.append((piece, half + UNDERPASS_SIDE_M))
     return out
 
 
@@ -415,19 +475,19 @@ def drawn(feats, i):
     sub = feats.attrs.get("subtype")
     if sub is None or str(sub[i]) != "rail":
         return None
+    w = wear(feats, i)
+    if w is None:
+        return None
     cls = feats.attrs.get("class")
     c = str(cls[i]) if cls is not None else "standard_gauge"
     osm = feats.attrs.get("osm_railway")
     if osm is not None and osm[i]:          # (OSM's own railway value: railtags.py, the weekly rail file)
         v = str(osm[i])
+        if v in OSM_RAILWAY_NOT:
+            return None
         if v in OSM_RAILWAY_WEAR:
             w = OSM_RAILWAY_WEAR[v]
             return (c if c in DRAWN else "standard_gauge", w)
-        if v in OSM_RAILWAY_NOT:
-            return None
-    w = wear(feats, i)
-    if w is None:
-        return None
     if c == "unknown" and w:
         c = "standard_gauge"
     return (c, w) if c in DRAWN else None
@@ -923,7 +983,7 @@ def crossing_props(frame, tx, ty, cells, ground, left_hand=False, kits=None):
                                                                      [ln for *_, ln in roads])):
         for ri, _arc_r, pt in crs:
             pt = np.asarray(pt, np.float64)
-            if not (box[0] <= pt[0] < box[2] and box[1] <= pt[1] < box[3]):
+            if not roadsmod.box_owns(box, pt[0], pt[1]):
                 continue
             lfid, rxy, rcls = rails[ri]
             w = worn.get(lfid, 0)
@@ -1026,7 +1086,7 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None):
     if not any(_box_hit((xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()),
                         (ex[0] - STEP_M, ex[1] - STEP_M, ex[2] + STEP_M, ex[3] + STEP_M)) for *_, xy in rails):
         return None
-    prof = profile(rails, ground, tunnels)
+    prof = profile(rails, ground, tunnels + coarse_underpasses(frame, cells, box, rails))
     cr = crossings(frame, cells, box, reach=50.0) + tunnels
     crossers = []
     if cr:                                          # (one ground call for all of them: its cost is per call)
@@ -1103,3 +1163,24 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None):
     if out is not None and len(out[0]) > VERTS_MAX:     # (the ballast and rails alone past it: a rail yard)
         return None
     return out
+
+
+# The materials only drawn (from mpsteppe's lean rail collider, in Madderose's PR #41): the rails and sleepers were ~88 %
+# of a track's triangles (Tehachapi Loop, 16 tiles: 118.8k of 135.0k), all colliding, and a collision rebuild's cost
+# grows with every colliding triangle loaded. A car on the track now drives on the ballast's top (the railheads stand
+# 0.28 m over it); at a level crossing the track is flush with the road, which the car drives on either way.
+RENDER_ONLY = frozenset(STEEL_WORN + SLEEPER_WORN)
+
+
+def collision_mesh(mesh):
+    """tile_mesh's mesh without the rails and sleepers (RENDER_ONLY): the ballast, the decks and the piers, as
+    (positions, tris, uvs, materials, tri material) for a collision-only shape (the vertices are the full mesh's:
+    cdae drops the unused ones), or None if nothing is left. Pure."""
+    if mesh is None:
+        return None
+    P, T, UV, mats, M = mesh
+    M = np.asarray(M)
+    keep = ~np.isin(M, [k for k, m in enumerate(mats) if m in RENDER_ONLY])
+    if not keep.any():
+        return None
+    return P, np.asarray(T)[keep], UV, mats, M[keep]

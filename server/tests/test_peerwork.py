@@ -300,7 +300,7 @@ class SharedRenderingTest(unittest.TestCase):
                 pool = helper.pool(settings)
                 self.assertIs(helper.pool(settings), pool)
                 self.assertIs(factory.call_args.kwargs["initargs"][-1], mode)
-                factory.call_args.kwargs["initargs"][6].close()
+                self.assertIsNone(factory.call_args.kwargs["initargs"][6], "no warm queue: far tiles plan no roads ahead")
             self.assertEqual(factory.call_count, 2)
 
     def test_invalid_wire_mode_is_rejected(self):

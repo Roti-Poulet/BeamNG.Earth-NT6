@@ -21,6 +21,10 @@ end
 function vecmt:dot(b) return self.x * b.x + self.y * b.y + self.z * b.z end
 function vecmt:cross(b) return vec3(self.y * b.z - self.z * b.y, self.z * b.x - self.x * b.z, self.x * b.y - self.y * b.x) end
 function vecmt:toFloat3() return self end
+function vecmt:set(x, y, z)          -- (the game's LuaVec3:set: three numbers, or a vector)
+  if y == nil then x, y, z = x.x, x.y, x.z end
+  self.x, self.y, self.z = x, y, z
+end
 function quat(x, y, z, w)
   if type(x) == 'table' then x, y, z, w = x.x, x.y, x.z, x.w end
   return { x = x or 0, y = y or 0, z = z or 0, w = w or 1 }

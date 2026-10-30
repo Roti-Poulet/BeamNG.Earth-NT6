@@ -45,6 +45,22 @@ CONNECTOR_M = 0.0              # m: ... and nodes joined by a road shorter than 
 CONNECTOR_WIDTHS = 1.0          # ... or by a connector no longer than this many times the widest road at its two
                                 # nodes: an offset junction lying within the carriageway (Fells Point, 10 m between
                                 # two nodes of 10.6 m streets, 2026-10-17)
+# Corners without curbs (find(pavement=True), roadcorners.py; from PR #363 by cody196): a rural junction's asphalt
+# rounded off at PAVE_RADIUS, PAVE_RADIUS_MAJOR where a major road meets; a driveway's or a lot's service road keeps
+# the service class's small radius (RADII: a 12 m flare at every driveway along a highway is not what the aerials show)
+PAVE_RADIUS = 6.0
+PAVE_RADIUS_MAJOR = 12.0
+PAVE_MAJOR = {"motorway", "trunk", "primary", "secondary"}
+
+
+def pave_radius(spi, spj, radius):
+    """The return radius of a corner of roads spi, spj in pavement mode (radius: their curb return's, RADII)."""
+    from roads import has_sidewalks
+    if has_sidewalks(spi) and has_sidewalks(spj):
+        return radius
+    if "service" in (spi.cls, spj.cls):
+        return RADII["service"]
+    return max(radius, PAVE_RADIUS_MAJOR if (spi.cls in PAVE_MAJOR or spj.cls in PAVE_MAJOR) else PAVE_RADIUS)
 
 
 def _unit(v):
@@ -259,7 +275,25 @@ def _across(roads, bi, bj, cr, X, walk_w, debug=None):
     return {"arc": curb, "inward": nrm, "outer": outer, "fill": None, "fills": fills, "ramps": []}, ti, tj
 
 
-def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False, debug=None):
+def _near_node_pairs(pos, radius):
+    """Node pairs (a < b) closer than radius, in the all-pairs scan's order, from a grid of radius-sized bins (the
+    scan was quadratic: a dense town tile's few thousand junction nodes; cody196's PR #363)."""
+    if radius <= 0:
+        return
+    bins, keys = {}, []
+    for i, p in enumerate(pos):
+        key = (math.floor(p[0] / radius), math.floor(p[1] / radius))
+        keys.append(key)
+        bins.setdefault(key, []).append(i)
+    for a, (x, y) in enumerate(keys):
+        near = sorted(b for dx in (-1, 0, 1) for dy in (-1, 0, 1) for b in bins.get((x + dx, y + dy), ()) if b > a)
+        for b in near:
+            if math.hypot(*(pos[a] - pos[b])) < radius:
+                yield a, b
+
+
+def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False, debug=None, pavement=False,
+         pavement_bounds=None):
     """Corners, cuts and crosswalks of the junctions among `roads` [(fid, spec, pts (k, 3), lon)].
     has_walk(spec) -> bool; walk_w: sidewalk width. Returns
         corners: [dict(arc (n, 3) curb points, inward (n, 2) unit vectors toward the sidewalk,
@@ -268,7 +302,12 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
         crosswalks: [dict(a (3,), b (3,), w)]: across a road, curb to curb
         ramps: {(fid, side): [(node xy, branch u, t0, t1)]}: curb ramp along that sidewalk
         line_cuts: {fid: [(node xy, branch u, t)]}: that road's markings start t m from the node
-                   (beyond its crosswalk)"""
+                   (beyond its crosswalk)
+    pavement: the corners' pavement alone (roadcorners.py: junctions without curbs; has_walk says which roads get
+    corners): pave_radius returns, no crosswalks or stop lines, and every corner also has road_sides ((fid, side),
+    (fid, side)): the two road edges it joins (side +1 left / -1 right of the geometry), and edge_cuts: their cuts.
+    pavement_bounds: (x0, y0, x1, y1) for pavement callers: the junctions provably outside it are skipped (every road
+    still groups and tests the others)."""
     nodes = {}
     for ri, (fid, spec, pts, lon) in enumerate(roads):
         for vi, p in enumerate(pts):
@@ -287,10 +326,8 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
             parent[a] = parent[parent[a]]
             a = parent[a]
         return a
-    for a in range(len(jn)):
-        for b in range(a + 1, len(jn)):
-            if math.hypot(*(pos[a] - pos[b])) < MERGE_M:
-                parent[root(a)] = root(b)
+    for a, b in _near_node_pairs(pos, MERGE_M):
+        parent[root(a)] = root(b)
     # and junction nodes joined by a short connector (along a road: the five-way at Fells Point was
     # two nodes 10 m apart)
     node_of = {}
@@ -306,7 +343,8 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
         on = [(vi, node_of[(ri, vi)]) for vi in range(len(pts)) if (ri, vi) in node_of]
         for (v0, a), (v1, b) in zip(on[:-1], on[1:]):
             L = s_at[v1] - s_at[v0]
-            if L < CONNECTOR_M or L <= CONNECTOR_WIDTHS * max(node_w[a], node_w[b]):
+            if not getattr(spec, "roundabout", False) and (L < CONNECTOR_M or
+                                                           L <= CONNECTOR_WIDTHS * max(node_w[a], node_w[b])):
                 parent[root(a)] = root(b)
                 reach[ri] = max(reach.get(ri, 0.0), float(L) + 0.5)
                 if a != b:
@@ -338,6 +376,15 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
     for cid in sorted(groups, key=lambda c: tuple(np.round(pos[groups[c][0]], 2))):
         inc = sorted({x for a in groups[cid] for x in jn[a]})
         X = np.mean([pos[a] for a in groups[cid]], axis=0)
+        if pavement_bounds is not None and pavement and walk_w == 0.0 and parking_m == 0.0 and len(groups[cid]) == 1:
+            # (PR #363) a simple corner's tangents are <= 40 m out (below), its arc at most two radii from a tangent
+            # and its fill's tip <= 20 + MERGE_M from X; merged junctions (_across) are kept whole
+            radius = max(PAVE_RADIUS_MAJOR, RADIUS, *(RADII.get(roads[ri][1].cls, RADIUS) for ri, _ in inc))
+            extent = max(40.0 + max(roads[ri][1].width for ri, _ in inc) / 2 + 2 * radius, 20.0 + MERGE_M) \
+                + 2 * NODE_TOL
+            bx0, by0, bx1, by1 = pavement_bounds
+            if X[0] + extent < bx0 or X[0] - extent > bx1 or X[1] + extent < by0 or X[1] - extent > by1:
+                continue
         branches = []                           # (angle, ri, vi, step, u, side of the road on u's left, origin)
         for ri, vi in inc:
             pts = roads[ri][2]
@@ -365,7 +412,7 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
             spi, spj = roads[ri][1], roads[rj][1]
             na, nb = node_of[(ri, vi)], node_of[(rj, vj)]
             cr = connector.get(frozenset((na, nb))) if na != nb else None
-            if cr is not None and has_walk(spi) and has_walk(spj):
+            if cr is not None and has_walk(spi) and has_walk(spj) and not pavement:     # (a curb's: not pavement's)
                 # two nodes of a merged junction: the curb turns onto the connector's edge at one node,
                 # runs along it and turns off at the other (an offset junction, Fells Point 2026-10-17)
                 got = _across(roads, branches[i], branches[j], cr, X, walk_w, debug)
@@ -404,6 +451,8 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
             # its own carriageway: no corner, bare ground in the angle, the user's report #46, 2026-10-17)
             for rscale in RADIUS_TRIES:
                 radius = max(RADII.get(spi.cls, RADIUS), RADII.get(spj.cls, RADIUS)) * rscale
+                if pavement:
+                    radius = pave_radius(spi, spj, radius / rscale) * rscale
                 if acute:
                     radius = min(radius, max(ACUTE_R_MIN, ACUTE_T_M * math.tan(math.radians(theta / 2))))
                 Z = _line_x(Pi + ni * (di + radius), ui, Pj - nj * (dj + radius), uj)
@@ -475,6 +524,9 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
                         debug.append(('on carriageway', hit[:8], hit in internal, roads[ri][0][:8], roads[rj][0][:8], round(theta), X.round(1).tolist()))
                     continue
                 corner = {"arc": curb, "inward": nrm, "outer": outer, "fill": fill, "ramps": []}
+                if pavement:
+                    corner["road_sides"] = ((roads[ri][0], li), (roads[rj][0], -lj))
+                    corner["edge_cuts"] = ((Pi.copy(), ui, ci), (Pj.copy(), uj, cj))
                 corners.append(corner)
                 cuts.setdefault((roads[ri][0], li), []).append((Pi.copy(), ui, ci))
                 cuts.setdefault((roads[rj][0], -lj), []).append((Pj.copy(), uj, cj))
@@ -485,10 +537,14 @@ def find(roads, has_walk, walk_w, parking_m=0.0, has_parking=lambda spec: False,
                 break
             else:
                 continue
+        if pavement:
+            continue                            # (pavement alone: no pedestrian crossings)
         for i in range(n):                      # crosswalk + ramps on a branch with both corners
             if (i, "L") in side_t and (i, "R") in side_t:
                 ai, ri, vi, si, ui, li, Pi = branches[i]
                 spec = roads[ri][1]
+                if getattr(spec, "roundabout", False):
+                    continue                    # (none across a ring's circulation)
                 w = spec.width / 2
                 dw = w - (parking_m if has_parking(spec) else 0.0)     # curb to curb at the bulbs
                 t = max(side_t[(i, "L")][0], side_t[(i, "R")][0]) + CW_GAP + CROSSWALK["w"] / 2
@@ -557,7 +613,9 @@ def apply_cuts(line, cuts, near=40.0):
         """The point between a removed sample and a kept one where its cut's cross-section lies."""
         for f, inside in alongs:
             if inside[k_out] and not inside[k_in] and f[k_in] != f[k_out]:
-                w = f[k_in] / (f[k_in] - f[k_out])
+                # (between the two samples: where the line leaves the cut by its side or behind the node rather than
+                # across t, both f are of one sign, and the line ran on 3 km past its tile, 2026-10-28)
+                w = min(1.0, max(0.0, f[k_in] / (f[k_in] - f[k_out])))
                 return d[k_in] + w * (d[k_out] - d[k_in])
         return d[k_in]
     out, start = [], None

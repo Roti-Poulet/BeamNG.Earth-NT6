@@ -85,6 +85,24 @@ def cache_dir(user_dir):
     return os.path.join(user_dir, "temp", "art", "terrainmaterialcache")
 
 
+def stored_png(rgb):
+    """PNG bytes of an RGB image (uint8 [h, w, 3]): rows unfiltered, deflate level 0 (stored). The base photo's file,
+    which the game reads only when its packed cache entry is stale: Pillow at level 0 still filtered every row (0.43 s
+    for a 4096² photo, this 0.10 s; 2026-10-28)."""
+    import struct
+    import zlib
+    rgb = np.ascontiguousarray(rgb, np.uint8)
+    h, w = rgb.shape[:2]
+    raw = np.empty((h, w * 3 + 1), np.uint8)
+    raw[:, 0] = 0
+    raw[:, 1:] = rgb.reshape(h, -1)
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 0)) + chunk(b"IEND", b""))
+
+
 def base_entry(user_dir, base_vfs, ao_vfs, rgb, ao_value):
     """Write the packed base texture (RGB = the photo, A = the flat AO value) into the game's cache, atomically.
     Call after the photo file itself is written (the cache must be the newer one)."""

@@ -18,6 +18,7 @@ import time
 import numpy as np
 
 import netfetch
+import signshards
 
 log = logging.getLogger("earthd.railtags")
 
@@ -164,3 +165,141 @@ class RailTags(Shards):
         pad = 0.002
         feats.__dict__["_rail_nodes"] = [(lo, la, t) for _id, lo, la, t in sh.get("nodes", ())
                                          if lon0 - pad <= lo <= lon1 + pad and lat0 - pad <= la <= lat1 + pad]
+
+
+LANES_ON = os.environ.get("BNE_LANETAGS", "on") != "off"
+# OpenStreetMap's lane-level road tags (tools/build_lane_tags.py), attrs osm_<key with ':' as '_'>: the road markings'
+# lane-by-lane data (markings.py)
+LANE_COLUMNS = ("turn:lanes", "turn:lanes:forward", "turn:lanes:backward", "turn:lanes:both_ways", "change:lanes",
+                "change:lanes:forward", "change:lanes:backward", "placement", "placement:forward", "placement:backward",
+                "lanes:forward", "lanes:backward", "lanes:both_ways", "overtaking", "overtaking:forward",
+                "overtaking:backward", "divider", "lane_markings", "bus:lanes", "busway", "hov:lanes",
+                "junction")     # (roundabout rings: roads._rings, attrs osm_junction)
+
+
+def lane_attr(key):
+    return "osm_" + key.replace(":", "_")
+
+
+class LaneTags(Shards):
+    def __init__(self, cache_dir, fetcher):
+        super().__init__(cache_dir, fetcher, "lanes")
+
+    def join(self, feats, key):
+        """Add OSM's lane tags (attrs lane_attr(k) for k in LANE_COLUMNS, None where absent) to cell key's road
+        segments, in place, joined by way id. Nothing when the shard cannot be had."""
+        sub = feats.attrs.get("subtype")
+        if sub is None or not len(feats):
+            return
+        road = np.flatnonzero(np.asarray(sub).astype(str) == "road")
+        if not len(road):
+            return
+        sh = self.of_cell(key)
+        if sh is None:
+            return
+        ways = sh.get("ways", {})
+        rec = feats.attrs.get("src_record")
+        cols = {c: np.full(len(feats), None, object) for c in LANE_COLUMNS}
+        if rec is not None and ways:
+            for i in road:
+                t = ways.get(way_id(str(rec[i])) or "")
+                if t:
+                    for c in LANE_COLUMNS:
+                        if c in t:
+                            cols[c][i] = t[c]
+        for c in LANE_COLUMNS:
+            feats.attrs[lane_attr(c)] = cols[c]
+
+
+SIGNS_ON = os.environ.get("BNE_SIGNTAGS", "on") != "off"
+# a local shard set (tools/build_sign_tags.py's output folder) read instead of the Pages one: tests and probes
+SIGNS_DIR = os.environ.get("BNE_SIGNS_DIR") or None
+SIGN_KINDS = signshards.KINDS
+class SignTags(Shards):
+    """Highway sign sources from OpenStreetMap (tools/build_sign_tags.py, dataset "signs"): exits (a motorway
+    junction's ramp with its posted destinations and the approach before it), overhead destinations (directed
+    mainline destination tags) and Interstate mile references (milestones). Each shard: {"objects": [{"id", "k":
+    exit | through | mile, "lon", "lat", "d": {...}}]}, a record in the shard of its point. query() gives them in the
+    form the sign modules take (exitsigns / throughsigns / milemarkers: {"id", "lon", "lat", "tags", "ways",
+    "<kind>": d}). Not published yet, offline or unreachable: nothing (Shards: the manifest asked again after
+    RETRY_S, netfetch's miss cache)."""
+
+    def __init__(self, cache_dir, fetcher, local=None):
+        super().__init__(cache_dir, fetcher, "signs")
+        self.local = local if local is not None else SIGNS_DIR
+        self.index = {}             # (x, y) -> (build, records, lon array, lat array)
+
+    def version(self):
+        if self.local is None:
+            return super().version()
+        if self.built is None:
+            try:
+                with open(os.path.join(self.local, "manifest.json"), encoding="utf-8") as fh:
+                    self.built = "local:" + str(json.load(fh).get("built"))
+            except (OSError, ValueError):
+                return None
+        return self.built
+
+    def shard(self, x, y):
+        if self.local is None:
+            return super().shard(x, y)
+        if self.version() is None:
+            return None
+        with self.lock:
+            got = self.shards.get((x, y))
+        if got is None:
+            try:
+                with gzip.open(os.path.join(self.local, str(x), f"{y}.json.gz"), "rt", encoding="utf-8") as fh:
+                    got = json.load(fh)
+            except FileNotFoundError:
+                got = {}
+            except (OSError, ValueError) as e:
+                log.debug("signs %s/%s: %s", x, y, e)
+                return None
+            with self.lock:
+                self.shards[(x, y)] = got
+        return got
+
+    def _indexed(self, x, y):
+        built = self.version()
+        if built is None:
+            return None
+        with self.lock:
+            got = self.index.get((x, y))
+            if got is not None and got[0] == built:
+                return got[1:]
+        sh = self.shard(x, y)
+        if sh is None:
+            return None
+        recs = [r for r in sh.get("objects", ()) if r.get("k") in SIGN_KINDS]
+        lon = np.array([float(r["lon"]) for r in recs], np.float64)
+        lat = np.array([float(r["lat"]) for r in recs], np.float64)
+        with self.lock:
+            self.index[(x, y)] = (built, recs, lon, lat)
+        return recs, lon, lat
+
+    def query(self, lon0, lat0, lon1, lat1, kinds=None):
+        """The records whose point is in the box, decoded, sorted by id ([] when there are none or no data)."""
+        if not ON or not SIGNS_ON or (self.fetcher is None and self.local is None):
+            return []
+        xa, ya = signshards.tile(lat1, lon0)
+        xb, yb = signshards.tile(lat0, lon1)
+        out = {}
+        for x in range(xa, xb + 1):
+            for y in range(ya, yb + 1):
+                got = self._indexed(x, y)
+                if got is None:
+                    continue
+                recs, lon, lat = got
+                for i in np.flatnonzero((lon >= lon0) & (lon <= lon1) & (lat >= lat0) & (lat <= lat1)):
+                    r = recs[int(i)]
+                    key = SIGN_KINDS[r["k"]]
+                    if kinds is not None and key not in kinds:
+                        continue
+                    d = dict(r.get("d") or {})
+                    for p in signshards.PATHS:
+                        if p in d:
+                            d[p] = signshards.decode_path(d[p], r["lon"], r["lat"])
+                    out[int(r["id"])] = {"id": int(r["id"]), "lon": float(r["lon"]), "lat": float(r["lat"]),
+                                         "tags": {}, "ways": [], key: d}
+        return [out[k] for k in sorted(out)]

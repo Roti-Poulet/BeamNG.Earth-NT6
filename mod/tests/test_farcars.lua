@@ -17,6 +17,8 @@ function quat(...) return setmetatable(rawQuat(...), qmt) end
 local anchor = { ox = 0, oy = 0 }
 function anchor:enuToGeodetic(e, n, u) return n + self.oy, e + self.ox, u end
 function anchor:geodeticToEnu(lat, lon, h) return lon - self.ox, lat - self.oy, h end
+function anchor:worldToGeodetic(e, n, u) return self:enuToGeodetic(e, n, u) end
+function anchor:geodeticToWorld(lat, lon, h) return self:geodeticToEnu(lat, lon, h) end
 local teleported
 beamngEarth_core = {
   _state = function() return { anchor = anchor } end,

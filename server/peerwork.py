@@ -494,7 +494,7 @@ class Helper:
                 p = self.pools[settings] = pools.RespawningPool(
                     "peer far tile", self.workers, mp_context=ctx, initializer=blockworker.init,
                     initargs=(self.cache_dir, False, roads, grading and roads, widths and roads, False,
-                              ctx.Queue(maxsize=1), logging.getLogger().level, airports, sea, 0, roads_in_ground))
+                              None, logging.getLogger().level, airports, sea, 0, roads_in_ground))
                 log.info("helper: worker pool for settings %s (%d processes)", dict(zip(SETTINGS, settings)),
                          self.workers)
             return p

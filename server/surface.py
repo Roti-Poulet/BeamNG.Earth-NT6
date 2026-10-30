@@ -17,6 +17,7 @@ the same every time.
 """
 import logging
 import math
+from collections import OrderedDict
 import os
 import struct
 import threading
@@ -258,21 +259,43 @@ def _lonlat_boxes(feats):
     return got
 
 
+ROAD_EDGE_M = 1.0    # m past a carriageway's edge its material reaches: a square whose centre is at most this far out
+                     # is road (a 2 m square reaches back up to 1.4 m: at 0.5 a wheel 0.2 m inside a 9 m road's edge was
+                     # on dirt; the grain beyond lies under the edge decal, roads.EDGE_DECAL)
+
+
 def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, extra=()):
     """idx (material per sample, [row, col], as classify gives it) with the roads of feats_list (the
     "roads" Features of the cells around) drawn in at their width: ROAD_MATERIAL by surface kind.
     lat / lon: the samples' positions; square: m between samples; urban_fn: as roads.road_specs (the
     same widths as the drawn roads); extra: [(lat (k,), lon (k,), roads.Spec)] more roads (a tunnel's open
-    sections, grading.Grader.open_tunnels). Pure (a new array)."""
+    sections, grading.Grader.open_tunnels). Each sample is a road's when it lies within the road's half width
+    (+ ROAD_EDGE_M) of its line (earthfast.mask_segments): PIL's thick lines put the material half a sample off the line
+    and an odd number of samples wide (an 11 m road painted 14 m, 1.4 m to one side: the asphalt's grain beyond the
+    edge line, GitHub #402). The engine gives each square the material of its south-west sample (the ground model under
+    a wheel and the detail texture both: a car 1.4 m inside a 9 m road's edge was on dirt, and the dirt's grain lay over
+    the asphalt along one edge; wheels swept across the edges in game, 2026-10-28): a sample is tested at the centre of
+    the square north-east of it. Pure (a new array)."""
     h, w = idx.shape
-    to_px = grid_affine(lat, lon)
-    layers = {k: Image.new("L", (w, h), 0) for k in ROAD_ORDER}
-    draws = {k: ImageDraw.Draw(im) for k, im in layers.items()}
-    lawn = Image.new("L", (w, h), 0)            # divided roads' medians (under the roads: they paint over it)
-    lawn_draw = ImageDraw.Draw(lawn)
-    verge = Image.new("L", (w, h), 0)           # a bare strip beside roads without sidewalks (VERGE_M)
-    verge_draw = ImageDraw.Draw(verge)
+    grid = grid_affine(lat, lon)
+    la_c, lo_c = float(np.mean(lat)), float(np.mean(lon))
+    m_lat = 1.0 / 111320.0
+    m_lon = m_lat / max(math.cos(math.radians(la_c)), 1e-6)
+    c0_, r0_ = grid(lo_c, la_c)
+    c1_, r1_ = grid(lo_c + m_lon * square / 2, la_c + m_lat * square / 2)
+    dc, dr = float(c1_ - c0_), float(r1_ - r0_)        # half a square east and north, in samples
+
+    def to_px(x, y):
+        c, r = grid(x, y)
+        return c - dc, r - dr
+    segs = {k: ([], []) for k in ROAD_ORDER}    # kind -> (segments (m, 4) in samples, half widths in samples)
+    lawn, verge = ([], []), ([], [])
     seen = set()
+
+    def add(dst, c, r, half):
+        if len(c) >= 2:
+            dst[0].append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+            dst[1].append(np.full(len(c) - 1, half / square))
 
     def line(x, y, spec, aisle):
         width, kind = spec.width, roadsmod.surface_material_kind(spec)
@@ -283,20 +306,14 @@ def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, e
             width += 2 * (spec.walk + square)   # the sidewalks (+ a sample: tufts at the outer edge): grass grew up
                                                 # through them (ground cover is the terrain's: Lauterbrunnen, Baltimore
                                                 # 2026-10-15)
-        # rounded up to an odd number of samples: a 9 m road was painted 8 m wide (round(4.5) = 4), and an even width
-        # sits half a sample off the line (PIL), its one edge a metre short
-        px = max(1, int(math.ceil(width / square - 1e-9)))
-        px += 1 - px % 2
-        # to a millionth of a sample: PIL floors, and a line on a sample row came out 63.99999999996 on Windows (its
-        # libm, the affine fit), drawn a sample north of where it lands on Linux
-        c, r = (np.round(v, 6) for v in to_px(x, y))
-        vx = 0 if walks else 2 * int(math.ceil(VERGE_M / square))     # (even: the verge stays odd, centred)
-        if c.max() < -px - vx or c.min() > w + px + vx or r.max() < -px - vx or r.min() > h + px + vx:
+        c, r = to_px(x, y)
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        reach = (width / 2 + ROAD_EDGE_M + (0 if walks else VERGE_M)) / square + 2
+        if c.max() < -reach or c.min() > w + reach or r.max() < -reach or r.min() > h + reach:
             return
-        pts = list(zip(c.tolist(), r.tolist()))
-        draws[kind].line(pts, fill=255, width=px, joint="curve")
-        if vx:
-            verge_draw.line(pts, fill=255, width=px + vx, joint="curve")
+        add(segs[kind], c, r, width / 2 + ROAD_EDGE_M)
+        if not walks:
+            add(verge, c, r, width / 2 + ROAD_EDGE_M + VERGE_M)    # (VERGE_M past the road's material)
 
     for feats in feats_list:
         if feats is None or len(feats) == 0:
@@ -329,18 +346,77 @@ def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, e
                     off = roadsmod.offset_polyline(np.c_[xy, np.zeros(len(xy))],
                                                    ms * (specs[i].width / 2 + mw / 2))[:, :2] / sc + ring[0, :2]
                     c, r = to_px(off[:, 0], off[:, 1])
-                    lawn_draw.line(list(zip(c.tolist(), r.tolist())), fill=255,
-                                   width=max(1, int(round(mw / square))), joint="curve")
+                    add(lawn, np.asarray(c, np.float64), np.asarray(r, np.float64), mw / 2)
     for la, lo, spec in extra:
         line(np.asarray(lo), np.asarray(la), spec, False)
+    # ramp gores, paved (gore_fills, in a frame at the grid's middle)
+    import geodesy
+    gfr = geodesy.EnuFrame(la_c, lo_c)
+    gb = gfr.geodetic_to_enu(np.array([float(np.min(lat)), float(np.max(lat))]),
+                             np.array([float(np.min(lon)), float(np.max(lon))]), np.zeros(2))
+    for hw_, mid in gore_fills(gfr, feats_list, (float(np.min(gb[0])) - 300, float(np.min(gb[1])) - 300,
+                                                 float(np.max(gb[0])) + 300, float(np.max(gb[1])) + 300), urban_fn, widths):
+        gla, glo, _ = gfr.enu_to_geodetic(mid[:, 0], mid[:, 1], np.zeros(len(mid)))
+        c, r = to_px(np.asarray(glo), np.asarray(gla))
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        sk = segs.setdefault("paved", ([], [])) if "paved" in segs else None
+        if sk is not None:
+            sk[0].append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+            sk[1].append(np.maximum(hw_[:-1], hw_[1:]) / square)
+    fast.require(91, "mask_segments")
+
+    def mask(dst):
+        m = np.zeros((h, w), bool)
+        if dst[0]:
+            fast._ef.mask_segments(m, np.ascontiguousarray(np.concatenate(dst[0])), np.concatenate(dst[1]))
+        return m
+
     out = idx.copy()
-    out[np.asarray(lawn) > 0] = LAWN
-    v = np.asarray(verge) > 0
+    out[mask(lawn)] = LAWN
+    # roundabout footprints: lawn under the grass photo fill (photo_roads), so tyres feel grass not asphalt scar
+    for lonlat in _island_lonlat_rings(feats_list, urban_fn, widths, lat0=la_c, lon0=lo_c, lat=lat, lon=lon):
+        c, r = to_px(lonlat[:, 0], lonlat[:, 1])
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        im = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(im).polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+        out[np.asarray(im) > 0] = LAWN
+    v = mask(verge)
+    # the rounded corners of curbless junctions (roadcorners.py): asphalt as their roads (ROAD_EDGE_M past the arc), a
+    # verge round them
+    lonlat_bounds = (float(np.min(lon)), float(np.min(lat)), float(np.max(lon)), float(np.max(lat)))
+    corner, corner_verge = (_corner_mask(feats_list, urban_fn, widths, lonlat_bounds, to_px, (h, w), grow)
+                            for grow in (ROAD_EDGE_M, ROAD_EDGE_M + VERGE_M))
+    if corner_verge is not None:
+        v |= corner_verge
     out[v & np.isin(out, VERGE_FROM)] = VERGE
     for k in ROAD_ORDER:
-        m = np.asarray(layers[k]) > 0
-        out[m] = ROAD_MATERIAL[k]
+        out[mask(segs[k])] = ROAD_MATERIAL[k]
+    if corner is not None:
+        out[corner] = ROAD_MATERIAL["paved"]
     return out
+
+
+def _corner_mask(feats_list, urban_fn, widths, lonlat_bounds, to_px, shape, grow):
+    """The samples (bool (h, w), to_px: (lon, lat) -> (col, row)) inside the rounded corners of feats_list's junctions
+    (roadcorners.pads, their arcs grown by grow m), or None (none on the grid)."""
+    import roadcorners
+    pads = roadcorners.pads(feats_list, urban_fn, widths, lonlat_bounds=lonlat_bounds, grow=grow)
+    if not pads:
+        return None
+    h, w = shape
+    im = None
+    for la, lo in pads:
+        c, r = to_px(np.asarray(lo), np.asarray(la))
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        if im is None:
+            im = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(im)
+        draw.polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+    return None if im is None else np.asarray(im) > 0
 
 
 # Roads in the ground (the user, 2026-10-22: "I dont love that we are applying a floating road texture over the normal
@@ -351,17 +427,23 @@ def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, e
 # meshes.
 # colour and opacity by surface, blended in this order (paved last: it wins at junctions); a trace of the photo is kept
 # (stains, patches), and most of it on unpaved tracks, which the photo shows well and a flat colour drew as stripes
+# paved alpha 1.0 (was 0.92): an old through-road scar in the photo stayed visible as a dark E–W band across
+# roundabout approaches even after island grass fill (Chavagnes-en-Paillers 2026-10-28)
 PHOTO_ROAD_RGBA = {"dirt": (122, 104, 82, 0.45), "gravel": (128, 118, 102, 0.6), "cobble": (112, 104, 96, 0.85),
-                   "paved": (95, 95, 94, 0.92)}
+                   "paved": (95, 95, 94, 1.0)}
 PHOTO_ROADS_MAX_TEXEL = 2.0     # m per texel: coarser far tiles keep the photo's own roads (far, under a pixel wide)
+PHOTO_ROAD_EDGE_M = 0.2         # m the photo's asphalt reaches past the drawn edge, under the edge decal's inner sliver (its
+                                # antialiased rim left a pale hair between the edge line and the decal)
 
 
-def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None):
+def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None, roads_of=None):
     """(segs (m, 4), half widths (m,), kind index into PHOTO_ROAD_RGBA (m,)) of the carriageways of feats_list in pixel
-    coordinates of a w x h photo over [x0, x0 + size] x [y0, y0 + size] (row 0 north), or None when none is in it."""
+    coordinates of a w x h photo over [x0, x0 + size] x [y0, y0 + size] (row 0 north), or None when none is in it.
+    roads_of: a list that gets, per segment, (its road's number, its road has no curb: roads.has_sidewalks)."""
     px_m = w / size
     kinds = list(PHOTO_ROAD_RGBA)
     segs, hws, kind = [], [], []
+    nroad = 0
     seen = set()
     for feats in feats_list:
         if feats is None or len(feats) == 0:
@@ -378,7 +460,7 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
             m = sp.width / 2        # (all of the feature off the photo: none of its rings is in it)
             if box[i, 1] < x0 - m or box[i, 0] > x0 + size + m or box[i, 3] < y0 - m or box[i, 2] > y0 + size + m:
                 continue
-            hw = sp.width * px_m / 2
+            hw = (sp.width / 2 + PHOTO_ROAD_EDGE_M) * px_m
             for ring in roadsmod.ground_parts(feats, i):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
                 c = (np.asarray(e) - x0) * px_m
@@ -388,9 +470,64 @@ def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=
                 segs.append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
                 hws.append(np.full(len(c) - 1, hw))
                 kind.append(np.full(len(c) - 1, kinds.index(sp.kind), np.uint8))
+                if roads_of is not None:
+                    roads_of.append((np.full(len(c) - 1, nroad, np.int64),
+                                     np.full(len(c) - 1, not roadsmod.has_sidewalks(sp) and sp.kind == "paved")))
+            nroad += 1
+    # ramp gores (markings.gores: the wedge between a ramp and its motorway is paved): as more paved segments
+    for hw_, mid in gore_fills(frame, feats_list, (x0 - 300, y0 - 300, x0 + size + 300, y0 + size + 300), urban_fn,
+                               widths):
+        c = (mid[:, 0] - x0) * px_m
+        r = (y0 + size - mid[:, 1]) * px_m
+        segs.append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+        hws.append(np.maximum(hw_[:-1], hw_[1:]) * px_m)
+        kind.append(np.full(len(c) - 1, kinds.index("paved"), np.uint8))
+        if roads_of is not None:
+            roads_of.append((np.full(len(c) - 1, nroad, np.int64), np.zeros(len(c) - 1, bool)))
+            nroad += 1
     if not segs:
         return None
     return np.concatenate(segs), np.concatenate(hws), np.concatenate(kind)
+
+
+_GORE_MEMO = OrderedDict()
+
+
+def gore_fills(frame, feats_list, box, urban_fn=None, widths=None):
+    """[(half widths (k,), middle line (k, 3) in frame)] of the paved wedges between ramps and their motorways
+    (markings.gores) whose roads come near box (x0, y0, x1, y1) of frame. Kept for a few calls with the same features
+    and square (a block photo asks twice: unghost_square, paint_square)."""
+    key = (tuple(getattr(f, "__dict__", {}).get("_bnge_cell") or id(f) for f in feats_list), frame.lat0, frame.lon0,
+           tuple(round(float(v), 1) for v in box))
+    got = _GORE_MEMO.get(key)
+    if got is None:
+        got = _gore_fills(frame, feats_list, box, urban_fn, widths)
+        _GORE_MEMO[key] = got
+        while len(_GORE_MEMO) > 8:
+            _GORE_MEMO.popitem(last=False)
+    return got
+
+
+def _gore_fills(frame, feats_list, box, urban_fn=None, widths=None):
+    import markings
+    near, seen = [], set()
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        specs = roadsmod.road_specs(feats, urban_fn, widths)
+        for i in range(len(feats)):
+            sp = specs[i]
+            fid = str(feats.ids[i])
+            if sp is None or fid in seen or not sp.oneway or sp.kind != "paved" or \
+                    (sp.cls not in markings.GORE_MAJOR and not sp.link):
+                continue
+            seen.add(fid)
+            for k, ring in enumerate(roadsmod.ground_parts(feats, i)):
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                if e.max() < box[0] or e.min() > box[2] or n.max() < box[1] or n.min() > box[3]:
+                    continue
+                near.append((f"{fid}:{k}", sp, np.c_[e, n, np.zeros(len(e))], 0.0))
+    return [(hw_, mid) for kind_, hw_, mid in (markings.gores(near) if near else ()) if kind_ == "fill" and len(mid) >= 2]
 
 
 def _feature_boxes(feats, frame):
@@ -417,17 +554,199 @@ def _feature_boxes(feats, frame):
     return got
 
 
+PHOTO_GHOST_M = 6.0     # m beside a curbless paved road where the photo's own pavement takes the ground beyond
+PHOTO_GHOST_TOL = 36.0  # RGB distance from the road's mean photo colour that counts as its pavement
+
+
+def photo_ghosts(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
+    """The photo rgb with its own pavement beside the drawn curbless paved roads (within PHOTO_GHOST_M of their edge,
+    coloured like the photo on the road) replaced by the ground beyond it, mirrored (earthfast.photo_ghosts), before
+    photo_roads paints the roads in: the map's carriageway is narrower than the photo's (its paved shoulders)
+    or a metre or two off it, and the photo's strip showed as a pale band beside one edge (Woodland Park, US-24: the
+    photo's pavement 17 m wide, the drawn road 11 m; the user, 2026-10-28). Pure (a new array)."""
+    h, w = rgb.shape[:2]
+    of = []
+    got = _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths, roads_of=of)
+    if got is None:
+        return rgb
+    segs, hws, _ = got
+    road = np.concatenate([a for a, _ in of])
+    ghost = np.where(np.concatenate([b for _, b in of]), PHOTO_GHOST_M * w / size, 0.0)
+    if not ghost.any():
+        return rgb
+    fast.require(92, "photo_ghosts")
+    out, _ = fast._ef.photo_ghosts(np.ascontiguousarray(rgb, np.uint8), np.ascontiguousarray(segs, np.float64),
+                                   np.ascontiguousarray(hws, np.float64), np.ascontiguousarray(ghost, np.float64),
+                                   np.ascontiguousarray(road, np.int64), int(road.max()) + 1, PHOTO_GHOST_TOL)
+    return out
+
+
+# Roundabout island fill (Chavagnes-en-Paillers 2026-10-28): the photo often still shows the old through-road
+# across the grass and as a dark E–W band on the approaches; carriageway paint leaves gaps so the scar stays visible.
+ISLAND_GRASS = (76, 98, 58)     # muted grass when the photo's own greens are too few to sample
+# Outset past the ring centreline so the fill covers the whole roundabout footprint (island + carriageways); paint_lines
+# then redraws the asphalt on top and only the island centre stays grass.
+ISLAND_OUTSET_M = 8.0
+
+
+def _outset_poly(xy, metres):
+    """xy (k, 2) scaled out from its centroid by metres along each radius (a roundabout footprint)."""
+    c = xy.mean(0)
+    d = xy - c
+    r = np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-3)
+    return c + d * ((r + metres) / r)[:, None]
+
+
+def _roundabout_footprints(roads_list):
+    """Metre polygons (k, 2) of each roundabout's full footprint (centreline loop outset by ISLAND_OUTSET_M)."""
+    import islands as islandsmod
+    out = []
+    for f in islandsmod.find(roads_list):
+        if not f.get("round"):
+            continue
+        # centreline loop (covers island + half the ring); outset reaches the outer verge so the ortho scar under
+        # the ring and the splitter noses is covered before carriageways paint back on top
+        xy = np.asarray(f["poly"], np.float64)[:, :2]
+        out.append(_outset_poly(xy, ISLAND_OUTSET_M))
+    return out
+
+
+# m round the painted area a road may lie and still be part of a roundabout reaching it (islands.MAX_AREA_M2: ~120 m
+# across, + ISLAND_OUTSET_M). Only those go to islands.find: all the roads of the cells round a photo square or a block
+# took ~125 ms a call in Fells Point, its painting of the roads themselves 3 ms (merge of PR #468, 2026-10-29)
+ISLAND_REACH_M = 150.0
+
+
+def _roads_list_enu(frame, feats_list, urban_fn=None, widths=None, bounds=None):
+    """islands.find roads_list from feats_list in frame ENU metres; bounds (x0, y0, x1, y1): only the roads with a
+    point within ISLAND_REACH_M of it."""
+    roads_list = []
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        specs = roadsmod.road_specs(feats, urban_fn, widths)
+        fb = None
+        if bounds is not None:
+            r = ISLAND_REACH_M
+            b = feats.boxes(frame)
+            fb = ((b[:, 2] >= bounds[0] - r) & (b[:, 0] <= bounds[2] + r)
+                  & (b[:, 3] >= bounds[1] - r) & (b[:, 1] <= bounds[3] + r))
+        for i in range(len(feats)):
+            sp = specs[i]
+            if sp is None or (fb is not None and not fb[i]):
+                continue
+            for ring in roadsmod.ground_parts(feats, i):
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                if len(e) < 2:
+                    continue
+                roads_list.append((str(feats.ids[i]), sp,
+                                   np.column_stack([e, n, np.zeros(len(e))]), float(ring[0, 0])))
+    return roads_list
+
+
+def _island_lonlat_rings(feats_list, urban_fn=None, widths=None, lat0=None, lon0=None, lat=None, lon=None):
+    """Lon/lat polygons of roundabout footprints among feats_list (for paint_roads lawn); lat / lon (the painted
+    samples): only the roundabouts that can reach them (_roads_list_enu bounds)."""
+    import geodesy
+    if lat0 is None or lon0 is None:
+        for feats in feats_list:
+            if feats is None or len(feats) == 0:
+                continue
+            specs = roadsmod.road_specs(feats, urban_fn, widths)
+            for i in range(len(feats)):
+                if specs[i] is None:
+                    continue
+                for ring in roadsmod.ground_parts(feats, i):
+                    if len(ring) >= 2:
+                        lon0, lat0 = float(ring[0, 0]), float(ring[0, 1])
+                        break
+                if lat0 is not None:
+                    break
+            if lat0 is not None:
+                break
+    if lat0 is None:
+        return []
+    frame = geodesy.EnuFrame(float(lat0), float(lon0), 0.0)
+    bounds = None
+    if lat is not None and lon is not None and np.size(lat):
+        la_, lo_ = np.asarray(lat, np.float64).ravel(), np.asarray(lon, np.float64).ravel()
+        cla = np.array([la_.min(), la_.min(), la_.max(), la_.max()])
+        clo = np.array([lo_.min(), lo_.max(), lo_.min(), lo_.max()])
+        e, n, _ = frame.geodetic_to_enu(cla, clo, np.zeros(4))
+        bounds = (float(np.min(e)), float(np.min(n)), float(np.max(e)), float(np.max(n)))
+    out = []
+    for xy in _roundabout_footprints(_roads_list_enu(frame, feats_list, urban_fn, widths, bounds)):
+        la, lo, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], np.zeros(len(xy)))
+        out.append(np.column_stack([np.asarray(lo, np.float64), np.asarray(la, np.float64)]))
+    return out
+
+
+def _island_pixel_polys(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None):
+    """Pixel polygons (row 0 = north) of roundabout footprints among feats_list, for a w x h photo over
+    [x0, x0 + size]² of frame."""
+    px_m = w / size
+    out = []
+    for xy in _roundabout_footprints(_roads_list_enu(frame, feats_list, urban_fn, widths,
+                                                     (x0, y0, x0 + size, y0 + size))):
+        c = (xy[:, 0] - x0) * px_m
+        r = (y0 + size - xy[:, 1]) * px_m
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        out.append(list(zip(c.tolist(), r.tolist())))
+    return out
+
+
+def _fill_island_photos(rgb, polys):
+    """rgb with each roundabout footprint filled: median of its greener photo pixels, else ISLAND_GRASS. Covers the
+    old through-road scar; carriageways paint over the ring afterwards."""
+    if not polys:
+        return rgb
+    out = rgb.copy()
+    im = Image.fromarray(out)
+    draw = ImageDraw.Draw(im)
+    g = out.astype(np.int16)
+    green = (2 * g[..., 1] - g[..., 0] - g[..., 2]) >= LAWN_GREEN
+    for poly in polys:
+        mask = Image.new("L", (out.shape[1], out.shape[0]), 0)
+        ImageDraw.Draw(mask).polygon(poly, fill=255)
+        m = np.asarray(mask) > 0
+        if not m.any():
+            continue
+        sel = m & green
+        if sel.sum() >= 8:
+            fill = tuple(int(x) for x in np.median(out[sel], axis=0))
+        else:
+            fill = ISLAND_GRASS
+        draw.polygon(poly, fill=fill)
+    return np.asarray(im)
+
+
 def photo_roads(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
     """The photo rgb (H x W x 3, row 0 = north, covering [x0, x0 + size] x [y0, y0 + size] of frame) with the
     carriageways of feats_list (road Features: roads.road_specs widths, ground parts only) painted in, antialiased
-    (earthfast.paint_lines, PHOTO_ROAD_RGBA). Pure (a new array)."""
+    (earthfast.paint_lines, PHOTO_ROAD_RGBA). Roundabout footprints are filled with grass first so the photo's old
+    through-road scar does not show; carriageways paint over the ring. Pure (a new array)."""
     fast.require(49, "roads in the ground")
     h, w = rgb.shape[:2]
+    # the rounded corners of curbless junctions (roadcorners.py) in the asphalt's colour, under the roads
+    rgb = photo_corners(rgb, frame, x0, y0, size, corner_pads(frame, x0, y0, size, feats_list, urban_fn, widths))
+    filled = _fill_island_photos(np.ascontiguousarray(rgb, np.uint8),
+                                 _island_pixel_polys(frame, x0, y0, size, w, h, feats_list, urban_fn, widths))
     got = _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths)
     if got is None:
-        return rgb
+        return filled
     colors = np.array([PHOTO_ROAD_RGBA[k] for k in PHOTO_ROAD_RGBA], np.float32)
-    return fast._ef.paint_lines(np.ascontiguousarray(rgb, np.uint8), *got, colors)
+    return fast._ef.paint_lines(np.ascontiguousarray(filled, np.uint8), *got, colors)
+
+
+def corner_pads(frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
+    """The rounded corners (roadcorners.pads) that may reach a photo square [x0, x0 + size]² of frame, their arcs grown
+    by PHOTO_ROAD_EDGE_M as the roads' paint (a few metres of margin: the bounds are rounded out anyway)."""
+    import roadcorners
+    if not feats_list:
+        return []
+    return roadcorners.pads(feats_list, urban_fn, widths, frame, bounds=(x0 - 4.0, y0 - 4.0, x0 + size + 4.0,
+                                                                          y0 + size + 4.0), grow=PHOTO_ROAD_EDGE_M)
 
 
 def _square_roads(frame, x0, y0, size, surface):
@@ -439,16 +758,53 @@ def _square_roads(frame, x0, y0, size, surface):
     return feats
 
 
+def enlarge(rgb, px):
+    """The photo rgb (h x w x 3 uint8) at px x px (a plain bilinear resize; as it was at that size already), so what
+    is painted into it after (roads, pads, rock) is drawn at the finer texel."""
+    rgb = np.asarray(rgb, np.uint8)
+    if rgb.shape[0] == px and rgb.shape[1] == px:
+        return rgb
+    return np.asarray(Image.fromarray(rgb, "RGB").resize((px, px), Image.BILINEAR), np.uint8)
+
+
+def _square_pts(frame, x0, y0, size):
+    gx = x0 + np.array([0.0, size, 0.0, size, size / 2])
+    gy = y0 + np.array([0.0, 0.0, size, size, size / 2])
+    la, lo, _ = frame.enu_to_geodetic(gx, gy, np.zeros(5))
+    return np.asarray(la), np.asarray(lo)
+
+
+def _square_lots(frame, x0, y0, size, surface):
+    """The infrastructure and land-use Features around a photo square (Surface.lots; never waits)."""
+    if surface is None or not hasattr(surface, "lots"):
+        return []
+    la, lo = _square_pts(frame, x0, y0, size)
+    return surface.lots(la, lo)
+
+
 def paint_square(rgb, frame, x0, y0, size, surface, widths=None):
     """photo_roads for a ground photo over [x0, x0 + size]² of frame with the roads of surface's cached cells (a
-    Surface; never waits); as it was when its texels are coarser than PHOTO_ROADS_MAX_TEXEL or no cell is cached."""
+    Surface; never waits); as it was when its texels are coarser than PHOTO_ROADS_MAX_TEXEL or no cell is cached.
+    Parking lots are painted first (photo_lots), then gas-station pads, then the carriageways over both."""
     if surface is None or size / max(rgb.shape[1], 1) > PHOTO_ROADS_MAX_TEXEL:
         return rgb
+    rgb = photo_lots(rgb, frame, x0, y0, size, _square_lots(frame, x0, y0, size, surface))
     rgb = photo_pads(rgb, frame, x0, y0, size, _square_pads(frame, x0, y0, size, surface))     # (under the roads)
     feats = _square_roads(frame, x0, y0, size, surface)
     if not feats:
         return rgb
     return photo_roads(rgb, frame, x0, y0, size, feats, surface.urban, widths)
+
+
+def unghost_square(rgb, frame, x0, y0, size, surface, widths=None):
+    """photo_ghosts for a ground photo over [x0, x0 + size]² of frame with the roads of surface's cached cells (never
+    waits; as paint_square), at the photo's own resolution, before it is enlarged and the roads painted in."""
+    if surface is None or size / max(rgb.shape[1], 1) > PHOTO_ROADS_MAX_TEXEL:
+        return rgb
+    feats = _square_roads(frame, x0, y0, size, surface)
+    if not feats:
+        return rgb
+    return photo_ghosts(rgb, frame, x0, y0, size, feats, surface.urban, widths)
 
 
 def _square_pads(frame, x0, y0, size, surface):
@@ -482,16 +838,20 @@ def road_mask(frame, x0, y0, size, px, surface, widths=None):
     if surface is None or size / max(px, 1) > ROAD_MASK_MAX_TEXEL:
         return None
     pads = pads_mask(frame, x0, y0, size, px, _square_pads(frame, x0, y0, size, surface))
+    lots = lots_mask(frame, x0, y0, size, px, _square_lots(frame, x0, y0, size, surface))
     feats = _square_roads(frame, x0, y0, size, surface)
     got = _road_segments(frame, x0, y0, size, px, px, feats, surface.urban, widths) if feats else None
-    if got is None:
-        return pads
-    colors = np.array([(255.0, 255.0, 255.0, 1.0 if k in ROAD_MASK_KINDS else 0.0) for k in PHOTO_ROAD_RGBA],
-                      np.float32)
-    out = fast._ef.paint_lines(np.zeros((px, px, 3), np.uint8), *got, colors)[..., 0]
-    if pads is not None:
-        out = np.maximum(out, pads)
-    return out if out.any() else None
+    corners = corners_mask(frame, x0, y0, size, px, corner_pads(frame, x0, y0, size, feats, surface.urban, widths)) \
+        if feats else None
+    out = None
+    if got is not None:
+        colors = np.array([(255.0, 255.0, 255.0, 1.0 if k in ROAD_MASK_KINDS else 0.0) for k in PHOTO_ROAD_RGBA],
+                          np.float32)
+        out = fast._ef.paint_lines(np.zeros((px, px, 3), np.uint8), *got, colors)[..., 0]
+    for extra in (pads, lots, corners):
+        if extra is not None:
+            out = extra if out is None else np.maximum(out, extra)
+    return None if out is None or not out.any() else out
 
 
 # A road without sidewalks gets a verge of VERGE_M a side painted bare where the ground would carry grass or shrubs:
@@ -577,6 +937,60 @@ def _pads_px(frame, x0, y0, size, w, h, pads):
     return out
 
 
+def _windows_px(frame, x0, y0, size, w, h, pads):
+    """Each pad's coverage in a w x h photo over [x0, x0 + size]² of frame (row 0 north) in its own small window: [(r0,
+    c0, coverage (float 0..1, 2x supersampled edges))]. (The rounded corners lie all over a photo: one image over their
+    common box was the whole photo, 0.15 s a 2048 px square.)"""
+    k = 2
+    px_m = w * k / size
+    out = []
+    for la, lo in pads:
+        e, n, _ = frame.geodetic_to_enu(np.asarray(la), np.asarray(lo), np.zeros(len(la)))
+        c = (np.asarray(e) - x0) * px_m
+        r = (y0 + size - np.asarray(n)) * px_m
+        c0 = max(0, int(c.min()) // k * k)
+        r0 = max(0, int(r.min()) // k * k)
+        c1 = min(w * k, -(-int(c.max() + 1) // k) * k)
+        r1 = min(h * k, -(-int(r.max() + 1) // k) * k)
+        if c1 <= c0 or r1 <= r0:
+            continue
+        im = Image.new("L", (c1 - c0, r1 - r0), 0)
+        ImageDraw.Draw(im).polygon(list(zip((c - c0).tolist(), (r - r0).tolist())), fill=255)
+        sub = np.asarray(im, np.float32).reshape((r1 - r0) // k, k, (c1 - c0) // k, k).mean(axis=(1, 3)) / 255.0
+        out.append((r0 // k, c0 // k, sub))
+    return out
+
+
+def photo_corners(rgb, frame, x0, y0, size, pads):
+    """photo_pads for many small pads spread over the photo (the rounded junction corners), each in its own window.
+    Pure."""
+    if not pads:
+        return rgb
+    h, w = rgb.shape[:2]
+    r_, g_, b_, op = PHOTO_ROAD_RGBA["paved"]
+    colour = np.array([r_, g_, b_], np.float32)
+    out = None
+    for r0, c0, a in _windows_px(frame, x0, y0, size, w, h, pads):
+        if out is None:
+            out = rgb.copy()
+        r1, c1 = r0 + a.shape[0], c0 + a.shape[1]
+        sub = (a * op)[..., None]
+        out[r0:r1, c0:c1] = np.clip(np.round(out[r0:r1, c0:c1].astype(np.float32) * (1.0 - sub) + colour * sub),
+                                    0, 255).astype(np.uint8)
+    return rgb if out is None else out
+
+
+def corners_mask(frame, x0, y0, size, px, pads):
+    """pads_mask for the rounded junction corners (each in its own window): px x px uint8, or None."""
+    out = None
+    for r0, c0, a in _windows_px(frame, x0, y0, size, px, px, pads):
+        if out is None:
+            out = np.zeros((px, px), np.uint8)
+        r1, c1 = r0 + a.shape[0], c0 + a.shape[1]
+        out[r0:r1, c0:c1] = np.maximum(out[r0:r1, c0:c1], np.round(a * 255.0).astype(np.uint8))
+    return out
+
+
 def photo_pads(rgb, frame, x0, y0, size, pads):
     """The photo rgb (H x W x 3, row 0 north, over [x0, x0 + size]² of frame) with the pads painted in the paved
     roads' colour (PHOTO_ROAD_RGBA). Pure."""
@@ -602,9 +1016,45 @@ def pads_mask(frame, x0, y0, size, px, pads):
     return None if a is None else np.round(a * 255.0).astype(np.uint8)
 
 
+def lot_pads(feats_list):
+    """Parking-lot outer rings as (lat, lon) pads for the photo painters (class parking, not grass or gravel)."""
+    pads = []
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        sel = _parking(feats)
+        if sel is None:
+            continue
+        for i in np.flatnonzero(sel & (feats.kind == 3)):
+            for part in feats.parts(i):
+                if not part or len(part[0]) < 3:
+                    continue
+                ring = np.asarray(part[0], np.float64)
+                pads.append((ring[:, 1], ring[:, 0]))
+    return pads
+
+
+def photo_lots(rgb, frame, x0, y0, size, feats_list):
+    """The photo with parking-lot polygons painted in the paved roads' colour (under the carriageways). Pure."""
+    return photo_pads(rgb, frame, x0, y0, size, lot_pads(feats_list))
+
+
+def lots_mask(frame, x0, y0, size, px, feats_list):
+    """The parking lots' coverage (px x px uint8, 255 inside) of a tile photo's square, or None."""
+    return pads_mask(frame, x0, y0, size, px, lot_pads(feats_list))
+
+
 def _parking(feats):
     cls = feats.attrs.get("class")
-    return None if cls is None else np.isin(cls.astype(str), list(PARKING_CLASSES))
+    if cls is None:
+        return None
+    sel = np.isin(cls.astype(str), list(PARKING_CLASSES))
+    surf = feats.attrs.get("surface")
+    if surf is not None:
+        import parking
+        bare = np.array([str(v or "").strip().lower() in parking.LOT_UNPAVED for v in surf], bool)
+        sel = sel & ~bare
+    return sel
 
 
 def _yards(feats):

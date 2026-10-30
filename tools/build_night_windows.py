@@ -41,7 +41,9 @@ WARMER = (1.0, 0.62, 0.30)
 COOL = (0.78, 0.86, 1.0)       # cool white, ~5000 K
 # The metal sheet (512 px): its bands 128 px high (BAND_OFFICE: 5 bays, BAND_OFFICE2: 4, BAND_SHOP: 2) and a factor
 # per bay (1 lit, lower dimmed, 0 dark)
-OFFICE_BAYS = [(5, (1.0, 0.35, 1.0, 0.0, 0.8)), (4, (0.9, 0.0, 1.0, 0.45)), (2, (1.0, 1.0)), (1, (0.6,))]
+# (fewer and dimmer than the stock map's every bay: every floor of a curtain wall takes the same band, so a lit bay is lit
+# from street to roof, and Manhattan's towers glowed white all over, TGForever Discord 2026-10-28)
+OFFICE_BAYS = [(5, (0.55, 0.0, 0.8, 0.0, 0.3)), (4, (0.0, 0.7, 0.25, 0.0)), (2, (1.0, 1.0)), (1, (0.6,))]
 
 
 def _read(zf, name):

@@ -678,6 +678,7 @@ local function switchToManual()
     local ok, err = pcall(st.set, 'weatherMode', 'manual')
     if not ok then log('W', 'beamngEarth', 'weather: saving the mode failed: ' .. tostring(err)) end
   end
+  log('I', 'beamngEarth', 'weather: changed by someone else: ' .. tostring(p.values) .. ' from' .. tostring(p.by))
   notify('Weather set to Manual because it was changed'
     .. (p.bwm and ' (BWM_Weather is changing the weather: set it to Clear with automatic weather off to keep real weather)' or '')
     .. '. Choose Real in the BeamNG.Earth settings to go back.')
@@ -770,7 +771,11 @@ function M.onEnvironmentChanged(changes)
   local keys = M.changedKeys(changes, env(), { groundWind = S.windSent })
   if #keys == 0 then return end
   S.quietUntil = S.clock + M.USER_QUIET_S
-  if not S.pending then S.pending = { at = S.clock, keys = keys } end
+  if not S.pending then
+    local vals = {}         -- (what and who, for the log: GitHub #418)
+    for _, k in ipairs(keys) do vals[#vals + 1] = k .. '=' .. tostring(changes[k]) end
+    S.pending = { at = S.clock, keys = keys, values = table.concat(vals, ', '), by = debug.traceback('', 2) }
+  end
 end
 
 function M.onAnyMissionChanged(state)

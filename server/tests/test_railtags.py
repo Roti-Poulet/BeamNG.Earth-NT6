@@ -71,3 +71,23 @@ class RailTagsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaneTagsTest(unittest.TestCase):
+    def test_road_segments_get_their_ways_lane_tags(self):
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(0.0, 0.0), (5.0, 5.0)], [(0.0, 120.0), (250.0, 120.0)]],
+                     ["primary", "residential", "standard_gauge"], subtypes=["road", "road", "rail"])
+        f.attrs["src_record"] = np.array(["w21@3", "w22@1", "w21@3"])
+        lo, la = f.lonlat[0]
+        key = mapcells.cell_of(float(la), float(lo))
+        sx, sy = key.x >> (key.z - 7), key.y >> (key.z - 7)
+        shard = {"ways": {"21": {"turn:lanes:forward": "left|through|through;right", "lanes:forward": "3",
+                                 "overtaking": "no"}}}
+        fetch = _Fetcher({"lanes/manifest.json": json.dumps({"built": "2026-10-30T03:00:00Z"}).encode(),
+                          f"lanes/{sx}/{sy}.json.gz": gzip.compress(json.dumps(shard).encode())})
+        with tempfile.TemporaryDirectory() as d:
+            railtags.LaneTags(d, fetch).join(f, key)
+        self.assertEqual(list(f.attrs["osm_turn_lanes_forward"]), ["left|through|through;right", None, None],
+                         "the road with the way's tags; a rail segment of the same way none")
+        self.assertEqual(f.attrs["osm_overtaking"][0], "no")
+        self.assertIsNone(f.attrs["osm_change_lanes"][0])

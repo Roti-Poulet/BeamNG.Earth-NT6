@@ -143,3 +143,30 @@ class YardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OffRoadsTest(unittest.TestCase):
+    """TGForever Discord 2026-10-28: a pylon on a highway's shoulder (its mapped tower node a few metres off)."""
+
+    def test_tower_moved_off_the_carriageway(self):
+        import gasstations
+        import geodesy
+        frame = geodesy.EnuFrame(40.0, -105.0)
+        road = (np.array([[-100.0, 0.0], [100.0, 0.0]]), 5.0)       # a centreline along x, 10 m carriageway
+        old = gasstations.drive_lines
+        gasstations.drive_lines = lambda frame, layers, x, y, r: [road]
+        try:
+            class Md:
+                def cell(self, key, layers, kind):
+                    raise OSError("not here")
+            e, n = np.array([10.0, 20.0, 30.0]), np.array([2.0, -1.0, 40.0])
+            la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(3))
+            e2, n2 = powerlines._off_roads(frame, Md(), e, n, np.stack([lo, la], -1))
+        finally:
+            gasstations.drive_lines = old
+        want = 5.0 + powerlines.TOWER_ROAD_CLEAR_M
+        self.assertAlmostEqual(n2[0], want)            # (straight away from the road, on its own side)
+        self.assertAlmostEqual(n2[1], -want)
+        self.assertAlmostEqual(e2[0], 10.0)
+        self.assertAlmostEqual(e2[1], 20.0)
+        self.assertEqual((e2[2], n2[2]), (30.0, 40.0))  # (far off it: where it is mapped)

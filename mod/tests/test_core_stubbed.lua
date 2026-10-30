@@ -348,7 +348,7 @@ veh.pos = vec3(9710, 0, 1200)
 T.check(pumpUntil(function() return #received('prepare_anchor') == 2 end, 5), 'prefetch at distance - 300 m')
 local req2 = received('prepare_anchor')[2]
 local a1 = geodesy.newAnchor(req.lat, req.lon)
-local plat, plon = a1:enuToGeodetic(9710, 0, 1200)
+local plat, plon = a1:worldToGeodetic(9710, 0, 1200)
 T.near(req2.lat, plat, 1e-9, 'prefetch lat = player lat'); T.near(req2.lon, plon, 1e-9, 'prefetch lon = player lon')
 T.check(req2.cx == 512 and req2.cy == 0, 'terrain hint = snap256(predicted position at the commit + 4 s * v) = (512, 0), got ' .. req2.cx)
 -- (terrain-follow keeps working in the old frame meanwhile; answer nothing to it)
@@ -369,7 +369,7 @@ frame()
 local fN = frameNo
 T.check(calls.setClusterPosRelRot > clusterMoves, 'rebase: vehicles moved')
 local a2 = geodesy.newAnchor(req2.lat, req2.lon)
-local xf = a1:transformTo(a2)
+local xf = a1:worldTransformTo(a2, 10000, 10, 1200)
 local ex, ey, ez = xf:apply(10000, 10, 1200)
 local lc = veh.lastCluster
 T.check(lc.node == -1, 'all clusters')
