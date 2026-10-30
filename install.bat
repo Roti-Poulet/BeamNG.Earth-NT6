@@ -12,7 +12,7 @@ call "%~dp0win7\rust_env.bat"
 if not exist "%PYTHON%" goto nopython
 rem Windows 7: make the native module (server\earthfast.pyd) loadable, see win7\patch_pyd.py
 if exist "win7\patch_pyd.py" "%PYTHON%" "win7\patch_pyd.py"
-"%PYTHON%" install.py %*
+"%PYTHON%" install.py --no-game%*
 echo.
 pause
 exit /b 0
